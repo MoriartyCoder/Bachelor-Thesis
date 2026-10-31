@@ -1,152 +1,161 @@
+import json
+
+import cv2
 import torch
 from torch.utils.data import Dataset
 from pathlib import Path
 import albumentations as A
+import numpy as np
 
+def sinusoidal_intensity_mapping(image, **kwargs):
+    """
+    Wendet eine sinusförmige Kurve auf die Pixelwerte an,
+    um periodische Kontrast-Kompressionen zu erzeugen.
+    """
+    # Auf [0, 1] skalieren
+    img_norm = image.astype(np.float32) / 255.0
+    
+    # Sinusförmiges Mapping (z.B. Verstärkung mittlerer Kontraste)
+    # sin(x * pi) mappt 0->0, 0.5->1.0, 1.0->0 (je nach Formel anpassbar)
+    mapped = np.sin(img_norm * np.pi) 
+    
+    # Zurück auf [0, 255] uint8 skalieren
+    return (np.clip(mapped, 0, 1) * 255).astype(np.uint8)
 
-
-transform = A.Compose(
+basic_augmentation = A.Compose(
     [
         A.HorizontalFlip(p=0.5),
         A.VerticalFlip(p=0.5),
         A.Rotate(limit=(-30, 30), p=0.5),
         A.RandomBrightnessContrast(p=0.2),
-        A.Normalize()
+        
     ]
 )
 
+# Definiere die IR-Augmentierungs-Pipeline
+ir_augmentation_pipeline = A.Compose([
+    #*basic_augmentation.transforms,
+    # 1. Simuliert thermisches Rauschen des Sensors
+    #A.GaussNoise(var_limit=(5.0, 25.0), p=0.5),
+    
+    # 2. Simuliert Thermal Blooming (leichtes Verschwimmen der Hitze)
+    #A.GaussianBlur(blur_limit=(3, 5), p=0.5),
+    
+    # 3. Simuliert Thermal Crossover / wechselnde Temperaturkontraste
+    #A.RandomBrightnessContrast(brightness_limit=0.15, contrast_limit=0.2, p=0.5),
+    
+    # 4. Verbessert/verschlechtert lokale Kontraste (wie echte Wärmebilder)
+    #A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=0.3),
+    
+    # 5. Simuliert Hitzeflimmern in Bodennähe
+    #A.OpticalDistortion(distort_limit=0.05, shift_limit=0.05, p=0.2),
+
+    #A.Lambda(image=sinusoidal_intensity_mapping, p=0.3),
+    A.Normalize()
+], bbox_params=A.BboxParams(format='coco', label_fields=['class_labels']),
+   save_applied_params=True)
+
+
+ir_augmentation_pipeline_bkg = A.Compose([
+    # 1. Simuliert thermisches Rauschen des Sensors
+    # The Power of Augmentations in IR Object Detection
+    A.GaussNoise(var_limit=(10.0, 50.0), p=0.3),
+    
+    # 2. Simuliert Thermal Blooming (leichtes Verschwimmen der Hitze)
+    # Augmentation of Atmospheric Turbulence Effects on Thermal-Adapted Object Detection Models
+    A.GaussianBlur(blur_limit=(3, 5), p=0.2),
+    
+    # 3. Simuliert Thermal Crossover / wechselnde Temperaturkontraste
+    # Open Dataset and Enhancement Method for Long-wave Thermal Diurnal Material
+    # LSOTB-TIR: A Large-Scale High-Diversity Thermal Infrared Object Tracking Benchmark
+    A.RandomBrightnessContrast(brightness_limit=0.15, contrast_limit=0.2, p=0.5),
+    
+    # 4. Verbessert/verschlechtert lokale Kontraste (wie echte Wärmebilder)
+    A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=0.3),
+    
+    # 5. Simuliert Hitzeflimmern in Bodennähe
+    A.OpticalDistortion(distort_limit=0.05, shift_limit=0.05, p=0.2),
+    A.GridDistortion(num_steps=5, distort_range=(-0.1, 0.1), p=0.2),
+    
+    # 6. Geometrische Standard-Augmentierungen (für Robustheit)
+    A.HorizontalFlip(p=0.5),
+    A.VerticalFlip(p=0.5),
+    A.Rotate(limit=15, p=0.3),
+    A.Normalize()
+], bbox_params=A.BboxParams(format='coco', label_fields=['class_labels']),
+   save_applied_params=True)
+
+
+
+class AugmentationError(Exception):
+    """Something went wrong while augmentation."""
+
 class AntiUAVDataset(Dataset):
-
-    def __init__(self, dataset_root_dir):
+    def __init__(self, dataset_root_dir, transform=None):
         self.dataset_root_dir = Path(dataset_root_dir)
-        pass
+        self.samples = []  # Flache Liste für alle einzelnen Frames
 
-    def __len__():
-        pass
+        # 1. Ordnerstruktur durchlaufen und alle Bilder + Labels einsammeln
+        # Wir suchen nach allen Sequenz-Ordnern im Split (z.B. train/val/test)
+        for seq_dir in self.dataset_root_dir.iterdir():
+            if not seq_dir.is_dir():
+                continue
+            
+            with open(seq_dir / "IR_label.json", 'r') as f:
+                annotations_data = json.load(f)
+
+            # Alle Bilder in dieser Sequenz finden
+            img_paths = sorted(list(seq_dir.glob("*.jpg")))
+            
+            for i, img_path in enumerate(img_paths):
+                
+                self.samples.append({
+                    'img_path': img_path,
+                    'bbox': annotations_data["gt_rect"][i],
+                    'exist': annotations_data["exist"][i]
+                })
+
+        # 2. Transform zuweisen
+        self.transform = transform if transform is not None else ir_augmentation_pipeline
+
+
+    def __len__(self) -> int:
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        pass
+        sample       = self.samples[idx]
+        boxes        = [sample['bbox']] if sample['exist'] == 1 else []
+        class_labels = [0] if boxes else []
+        
+        # 3. Bild laden (Infrarot als Grayscale)
+        img = cv2.imread(str(sample['img_path']), cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            raise FileNotFoundError(f"Konnte Bild nicht laden: {sample['img_path']}")
 
+        if self.transform:
+            try:
+                augmented = self.transform(
+                    image=img,
+                    bboxes=boxes,
+                    class_labels=class_labels
+                )
+                img_augmented = augmented['image']
+                boxes = augmented['bboxes']
+                #class_labels = augmented['class_labels']
+            except Exception as e:
+                # Falls z.B. eine Box durch Augmentierung aus dem Bild fliegt
+                raise AugmentationError(f"{str(sample['img_path'])} couldn't be augmentated!")
 
+        #img_tensor = torch.tensor(img_augmented, dtype=torch.float32).permute(2, 0, 1) / 255.0
+        img_tensor = torch.tensor(img_augmented, dtype=torch.float32).unsqueeze(0) / 255.0
 
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-#
-# This source code is licensed under the Apache License, Version 2.0
-# found in the LICENSE file in the root directory of this source tree.
+        target = {
+            "boxes": torch.tensor(boxes, dtype=torch.float32),
+            "labels": torch.tensor(class_labels, dtype=torch.int64),
+            "img_path": sample['img_path']
+        }
 
-import logging
+        if "applied_transforms" in augmented:
+            target["applied_transforms"] = augmented["applied_transforms"]
 
-from torchvision import transforms
-
-from .transforms import (
-    GaussianBlur,
-    make_normalize_transform,
-)
-
-
-logger = logging.getLogger("dinov2")
-
-
-class DataAugmentationDINO(object):
-    def __init__(
-        self,
-        global_crops_scale,
-        local_crops_scale,
-        local_crops_number,
-        global_crops_size=224,
-        local_crops_size=96,
-    ):
-        self.global_crops_scale = global_crops_scale
-        self.local_crops_scale = local_crops_scale
-        self.local_crops_number = local_crops_number
-        self.global_crops_size = global_crops_size
-        self.local_crops_size = local_crops_size
-
-        logger.info("###################################")
-        logger.info("Using data augmentation parameters:")
-        logger.info(f"global_crops_scale: {global_crops_scale}")
-        logger.info(f"local_crops_scale: {local_crops_scale}")
-        logger.info(f"local_crops_number: {local_crops_number}")
-        logger.info(f"global_crops_size: {global_crops_size}")
-        logger.info(f"local_crops_size: {local_crops_size}")
-        logger.info("###################################")
-
-        # random resized crop and flip
-        self.geometric_augmentation_global = transforms.Compose(
-            [
-                transforms.RandomResizedCrop(
-                    global_crops_size, scale=global_crops_scale, interpolation=transforms.InterpolationMode.BICUBIC
-                ),
-                transforms.RandomHorizontalFlip(p=0.5),
-            ]
-        )
-
-        self.geometric_augmentation_local = transforms.Compose(
-            [
-                transforms.RandomResizedCrop(
-                    local_crops_size, scale=local_crops_scale, interpolation=transforms.InterpolationMode.BICUBIC
-                ),
-                transforms.RandomHorizontalFlip(p=0.5),
-            ]
-        )
-
-        # color distorsions / blurring
-        color_jittering = transforms.Compose(
-            [
-                transforms.RandomApply(
-                    [transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1)],
-                    p=0.8,
-                ),
-                transforms.RandomGrayscale(p=0.2),
-            ]
-        )
-
-        global_transfo1_extra = GaussianBlur(p=1.0)
-
-        global_transfo2_extra = transforms.Compose(
-            [
-                GaussianBlur(p=0.1),
-                transforms.RandomSolarize(threshold=128, p=0.2),
-            ]
-        )
-
-        local_transfo_extra = GaussianBlur(p=0.5)
-
-        # normalization
-        self.normalize = transforms.Compose(
-            [
-                transforms.ToTensor(),
-                make_normalize_transform(),
-            ]
-        )
-
-        self.global_transfo1 = transforms.Compose([color_jittering, global_transfo1_extra, self.normalize])
-        self.global_transfo2 = transforms.Compose([color_jittering, global_transfo2_extra, self.normalize])
-        self.local_transfo = transforms.Compose([color_jittering, local_transfo_extra, self.normalize])
-
-    def __call__(self, image):
-        output = {}
-
-        # global crops:
-        im1_base = self.geometric_augmentation_global(image)
-        global_crop_1 = self.global_transfo1(im1_base)
-
-        im2_base = self.geometric_augmentation_global(image)
-        global_crop_2 = self.global_transfo2(im2_base)
-
-        output["global_crops"] = [global_crop_1, global_crop_2]
-
-        # global crops for teacher:
-        output["global_crops_teacher"] = [global_crop_1, global_crop_2]
-
-        # local crops:
-        local_crops = [
-            self.local_transfo(self.geometric_augmentation_local(image)) for _ in range(self.local_crops_number)
-        ]
-        output["local_crops"] = local_crops
-        output["offsets"] = ()
-
-        return output
-
-    def augment(self, image):
-        return self.__call__(image)
+        return img_tensor, target, img

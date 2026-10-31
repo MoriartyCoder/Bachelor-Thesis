@@ -40,6 +40,19 @@ def get_all_dir(root_dir):
             video_pathes.append(Path(dir))
     return video_pathes
 
+def reformat_json_file(file_path):
+    with open(file_path, "r", encoding="utf-8") as f:
+        data = json.load(f) 
+
+    # 2. Strukturiert und formatiert in eine neue Datei speichern
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(
+            data, 
+            f, 
+            indent=4,           # Sorgt für die saubere Einrückung (Strukturierung)
+            ensure_ascii=False  # Verhindert, dass Umlaute als Code (z.B. \u00fc) angezeigt werden
+        )
+
 
 def prepare_anti_uav_300():
     ANTI_UAV_300_DIR_NAME = "Anti-UAV-RGBT"
@@ -47,14 +60,14 @@ def prepare_anti_uav_300():
     ZIP_NAME = "Anti-UAV-RGBT.zip"
     archive_path = os.path.join(DATA_DIR, ZIP_NAME)
 
-    if os.path.exists(ANTI_UAV_300_DIR_PATH):
-        shutil.rmtree(ANTI_UAV_300_DIR_PATH)
-
     print(f"=== 1. Prüfe das Archiv in {DATA_DIR} ===")
     if not os.path.exists(archive_path):
         print(f"\n[!] FEHLER: Die Datei '{ZIP_NAME}' wurde nicht in '{DATA_DIR}' gefunden.")
         print(f"Lade das Dataset einmalig manuell im Browser herunter und lege es als '{ZIP_NAME}' in den Ordner '{DATA_DIR}/'.")
         exit(1)
+
+    if os.path.exists(ANTI_UAV_300_DIR_PATH):
+        shutil.rmtree(ANTI_UAV_300_DIR_PATH)
 
     print("=== 2. Entpacke Archiv mit 'unzip' ===")
     # Ruft den echten Bash-Befehl 'unzip' auf
@@ -86,16 +99,58 @@ def prepare_anti_uav_300():
             print(f"File not found. Not formatted. File: {file_path}")
             continue
 
-        with open(file_path, "r", encoding="utf-8") as f:
-            data = json.load(f) 
-
-        # 2. Strukturiert und formatiert in eine neue Datei speichern
-        with open(file_path, "w", encoding="utf-8") as f:
-            json.dump(
-                data, 
-                f, 
-                indent=4,           # Sorgt für die saubere Einrückung (Strukturierung)
-                ensure_ascii=False  # Verhindert, dass Umlaute als Code (z.B. \u00fc) angezeigt werden
-            )
+        reformat_json_file(file_path)
 
     print(f"\n=== Fertig! Datensatz in {DATA_DIR} ist bereit und bereinigt. ===")
+
+
+
+def prepare_anti_uav_410():
+    ANTI_UAV_410_DIR_NAME = "Anti-UAV410"
+    ANTI_UAV_410_DIR_PATH = DATA_DIR / ANTI_UAV_410_DIR_NAME
+    ZIP_NAME = "Anti-UAV410.zip"
+    archive_path = os.path.join(DATA_DIR, ZIP_NAME)
+
+    print(f"=== 1. Prüfe das Archiv in {DATA_DIR} ===")
+    if not os.path.exists(archive_path):
+        print(f"\n[!] FEHLER: Die Datei '{ZIP_NAME}' wurde nicht in '{DATA_DIR}' gefunden.")
+        print(f"Lade das Dataset einmalig manuell im Browser herunter und lege es als '{ZIP_NAME}' in den Ordner '{DATA_DIR}/'.")
+        exit(1)
+
+    if os.path.exists(ANTI_UAV_410_DIR_PATH):
+        shutil.rmtree(ANTI_UAV_410_DIR_PATH)
+
+    print("=== 2. Entpacke Archiv mit 'unzip' ===")
+    # Ruft den echten Bash-Befehl 'unzip' auf
+    subprocess.run(["unzip", "-q", str(archive_path), "-d", str(ANTI_UAV_410_DIR_PATH)], check=True)
+    print("Entpacken erfolgreich abgeschlossen.")
+
+    print("=== 3. Reformat json files ===")
+    for file_path in Path(ANTI_UAV_410_DIR_PATH).rglob("*.json"):
+        reformat_json_file(file_path)
+
+
+
+def prepare_anti_uav_cst():
+    CST_ANTI_UAV_DIR_NAME = "CST-AntiUAV"
+    CST_ANTI_UAV_DIR_PATH = DATA_DIR / CST_ANTI_UAV_DIR_NAME
+    ZIP_NAME = "CST-AntiUAV.zip"
+    archive_path = os.path.join(DATA_DIR, ZIP_NAME)
+
+    print(f"=== 1. Prüfe das Archiv in {DATA_DIR} ===")
+    if not os.path.exists(archive_path):
+        print(f"\n[!] FEHLER: Die Datei '{ZIP_NAME}' wurde nicht in '{DATA_DIR}' gefunden.")
+        print(f"Lade das Dataset einmalig manuell im Browser herunter und lege es als '{ZIP_NAME}' in den Ordner '{DATA_DIR}/'.")
+        exit(1)
+
+    if os.path.exists(CST_ANTI_UAV_DIR_PATH):
+        shutil.rmtree(CST_ANTI_UAV_DIR_PATH)
+
+    print("=== 2. Entpacke Archiv mit 'unzip' ===")
+    # Ruft den echten Bash-Befehl 'unzip' auf
+    subprocess.run(["unzip", "-q", str(archive_path), "-d", str(CST_ANTI_UAV_DIR_PATH)], check=True)
+    print("Entpacken erfolgreich abgeschlossen.")
+
+    print("=== 3. Reformat json files ===")
+    for file_path in Path(CST_ANTI_UAV_DIR_PATH).rglob("*.json"):
+        reformat_json_file(file_path)

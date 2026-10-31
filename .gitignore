@@ -1,7 +1,8 @@
-logs
-data
-output
+logs/
+data/
+output/
 .vscode
 .venv
 **/__pycache__
 .ipynb_checkpoints
+weights
