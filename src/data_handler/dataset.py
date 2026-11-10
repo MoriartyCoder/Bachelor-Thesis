@@ -111,7 +111,7 @@ class AntiUAVDataset(Dataset):
                 
                 self.samples.append({
                     'img_path': img_path,
-                    'bbox': annotations_data["gt_rect"][i],
+                    'bbox': annotations_data.get("gt_rect", annotations_data["gt"])[i],
                     'exist': annotations_data["exist"][i]
                 })
 
@@ -146,7 +146,6 @@ class AntiUAVDataset(Dataset):
                 # Falls z.B. eine Box durch Augmentierung aus dem Bild fliegt
                 raise AugmentationError(f"{str(sample['img_path'])} couldn't be augmentated!")
 
-        #img_tensor = torch.tensor(img_augmented, dtype=torch.float32).permute(2, 0, 1) / 255.0
         img_tensor = torch.tensor(img_augmented, dtype=torch.float32).unsqueeze(0) / 255.0
 
         target = {
