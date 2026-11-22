@@ -7,7 +7,7 @@ from pathlib import Path
 import albumentations as A
 import numpy as np
 
-def sinusoidal_intensity_mapping(image, **kwargs):
+def sinusoidal_intensity_mapping(image):
     """
     Wendet eine sinusförmige Kurve auf die Pixelwerte an,
     um periodische Kontrast-Kompressionen zu erzeugen.
@@ -91,9 +91,13 @@ class AugmentationError(Exception):
     """Something went wrong while augmentation."""
 
 class AntiUAVDataset(Dataset):
-    def __init__(self, dataset_root_dir, transform=None):
+    def __init__(self, dataset_root_dir, transform=None, debug=False):
         self.dataset_root_dir = Path(dataset_root_dir)
         self.samples = []  # Flache Liste für alle einzelnen Frames
+        self.debug = debug
+
+        if debug:
+            self.reverse_path = {}
 
         # 1. Ordnerstruktur durchlaufen und alle Bilder + Labels einsammeln
         # Wir suchen nach allen Sequenz-Ordnern im Split (z.B. train/val/test)
@@ -115,12 +119,23 @@ class AntiUAVDataset(Dataset):
                     'exist': annotations_data["exist"][i]
                 })
 
-        # 2. Transform zuweisen
+                if debug:
+                    self.reverse_path[str(img_path)] = len(self.samples) - 1
+
         self.transform = transform if transform is not None else ir_augmentation_pipeline
 
 
     def __len__(self) -> int:
         return len(self.samples)
+
+    def get_index_by_path(self, target_path: Path | str) -> Path | None:
+        '''
+        Horrible helper function.
+        Absolute path to the image.
+        '''
+        return self.reverse_path.get(str(target_path), None)
+
+
 
     def __getitem__(self, idx):
         sample       = self.samples[idx]
@@ -156,5 +171,12 @@ class AntiUAVDataset(Dataset):
 
         if "applied_transforms" in augmented:
             target["applied_transforms"] = augmented["applied_transforms"]
+
+        if self.debug:
+            debug_img = cv2.cvtColor(img_augmented, cv2.COLOR_GRAY2RGB)
+            for bbox in boxes:
+                x0, y0, x1, y1 = int(bbox[0]), int(bbox[1]), int(bbox[0] + bbox[2]), int(bbox[1] + bbox[3])
+                debug_img = cv2.rectangle(debug_img, (x0,y0), (x1,y1) ,color=(255, 0, 0))
+            target["debug"] = debug_img
 
         return img_tensor, target, img

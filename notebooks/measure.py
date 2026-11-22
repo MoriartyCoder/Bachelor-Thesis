@@ -1,0 +1,677 @@
+"""
+measure.py - Datenmessung fuer Thermal-UAV-Datensaetze (Anti-UAV410, CST Anti-UAV)
+=================================================================================
+Zweck: Die Groessen messen, die VOR der Wahl einer Augmentierung (Copy-Paste,
+SCR-angepasste Intensitaet, Blending, Platzierung) entschieden werden muessen.
+
+Architektur
+-----------
+EIN Durchlauf ueber Annotationen -> Tabelle (1 Zeile pro Frame, `build_frame_table`).
+Alle Tabellen-Auswertungen laufen ohne Bild-I/O. Pixel-Messungen laufen nur auf einer
+Stichprobe (`sample_frames`), gleichmaessig ueber jede Sequenz verteilt.
+
+Erwartetes Layout (aus 00_utils / 01_dataset_analysis abgeleitet)
+-----------------------------------------------------------------
+    <dataset_dir>/<split>/<sequenz>/000001.jpg ...   + IR_label.json (oder gt.txt)
+
+ANNAHMEN, die du an den echten Daten pruefen musst (siehe `inspect_annotation_format`):
+  1. Annotation i gehoert zum i-ten Bild in sortierter Dateireihenfolge.
+  2. Anti-UAV-Format: {"exist": [0/1,...], "gt_rect": [[x,y,w,h] | [], ...]}.
+  3. CST: Schluessel "gt" im JSON oder gt.txt mit x,y,w,h pro Zeile (unbestaetigt).
+  4. Alle Frames einer Sequenz haben dieselbe Aufloesung (erstes Frame wird gelesen).
+
+Typischer Ablauf (Notebook)
+---------------------------
+    from measure import *
+    df = build_frame_table(DATASET_DIR, cache=OUTPUT_DIR / f"{DATA_SET_NAME}_frames.pkl")
+    print(size_report(df, reference=DATA_SET_NAME))
+    print(presence_report(df))
+    smp = sample_frames(df, n_per_seq=20)
+    cdf = measure_target_contrast(smp, hud_rows=96)
+    print(contrast_report(cdf))
+"""
+from __future__ import annotations
+
+import json
+import re
+import warnings
+from pathlib import Path
+
+import cv2
+import numpy as np
+import pandas as pd
+from PIL import Image
+
+IMG_EXT = (".jpg", ".jpeg", ".png")
+
+# Groessenklassen nach Diagonale der Box, Definition aus dem CST-Anti-UAV-Paper
+CST_EDGES = [0, 10, 30, 50, np.inf]
+CST_LABELS = ["tiny", "small", "normal", "large"]
+
+# Zaehlwerte aus Table 1 des CST-Anti-UAV-Papers (alle Splits). NUR Plausibilitaetsabgleich:
+# weicht dein Ergebnis stark ab, zuerst Box-/Diagonalen-Definition und Loader pruefen.
+PAPER_REFERENCE = {
+    "CST-AntiUAV": {"tiny": 78224, "small": 155202, "normal": 11208, "large": 837},
+    "Anti-UAV410": {"tiny": 17071, "small": 126649, "normal": 97942, "large": 196735},
+}
+
+
+# =============================================================================
+# 0. Hilfsfunktionen
+# =============================================================================
+def _list_frames(seq_dir: Path) -> list[Path]:
+    return sorted(p for p in Path(seq_dir).iterdir() if p.suffix.lower() in IMG_EXT)
+
+
+def _parse_rect(r):
+    nan4 = (np.nan,) * 4
+    try:
+        if r is None or len(r) != 4:
+            return nan4
+        v = [float(t) for t in r]
+        return tuple(v) if np.all(np.isfinite(v)) else nan4
+    except (TypeError, ValueError):
+        return nan4
+
+
+def _even_idx(n_total: int, n_pick: int) -> np.ndarray:
+    return np.unique(np.linspace(0, n_total - 1, min(n_pick, n_total)).round().astype(int))
+
+
+def _box_int(r, W, H):
+    """Float-Box -> geklammerte Integer-Grenzen (x0, y0, x1, y1); None falls leer."""
+    x0, y0 = int(np.floor(r.x)), int(np.floor(r.y))
+    x1, y1 = int(np.ceil(r.x + r.w)), int(np.ceil(r.y + r.h))
+    c = (max(x0, 0), max(y0, 0), min(x1, W), min(y1, H))
+    return (x0, y0, x1, y1), (c if (c[2] > c[0] and c[3] > c[1]) else None)
+
+
+def _ks(a, b):
+    a, b = np.sort(a), np.sort(b)
+    allv = np.sort(np.concatenate([a, b]))
+    fa = np.searchsorted(a, allv, side="right") / len(a)
+    fb = np.searchsorted(b, allv, side="right") / len(b)
+    return float(np.abs(fa - fb).max())
+
+
+def _w1(a, b, n=200):
+    u = np.linspace(0.005, 0.995, n)
+    return float(np.mean(np.abs(np.quantile(a, u) - np.quantile(b, u))))
+
+
+# =============================================================================
+# 1. Laden: Annotationsformat pruefen, Sequenzen und Gesamttabelle
+# =============================================================================
+def inspect_annotation_format(seq_dir, n_show=3):
+    """ZUERST ausfuehren (je eine Sequenz pro Datensatz): zeigt, was wirklich im Label steht."""
+    seq_dir = Path(seq_dir)
+    print(f"Sequenz: {seq_dir.name} | Frames auf Platte: {len(_list_frames(seq_dir))}")
+    for jf in sorted(seq_dir.glob("*.json")):
+        data = json.loads(jf.read_text())
+        if isinstance(data, dict):
+            print(f"{jf.name}: dict, keys={list(data.keys())}")
+            for k, v in data.items():
+                if isinstance(v, list):
+                    print(f"   {k}: list len={len(v)}, Anfang={v[:n_show]}")
+                else:
+                    print(f"   {k}: {type(v).__name__} = {str(v)[:80]}")
+        else:
+            print(f"{jf.name}: {type(data).__name__}, len={len(data)}")
+    for tf in sorted(seq_dir.glob("*.txt")):
+        lines = tf.read_text().splitlines()
+        print(f"{tf.name}: {len(lines)} Zeilen, Anfang={lines[:n_show]}")
+
+
+def load_sequence_annotations(seq_dir) -> pd.DataFrame:
+    """Eine Zeile pro Frame (auch Frames ohne Ziel). Spalten:
+    seq, frame_idx, file, exist, x, y, w, h, valid_box, n_ann, n_frames, exist_source."""
+    seq_dir = Path(seq_dir)
+    frames = _list_frames(seq_dir)
+    n = len(frames)
+    rects, exist, source = None, None, None
+
+    for jf in sorted(seq_dir.glob("*.json")):
+        try:
+            data = json.loads(jf.read_text())
+        except Exception:
+            continue
+        if isinstance(data, dict):
+            for key in ("gt_rect", "gt"):
+                if key in data:
+                    rects, exist, source = data[key], data.get("exist"), f"{jf.name}:{key}"
+                    break
+        if rects is not None:
+            break
+
+    if rects is None:  # Fallback gt.txt: x,y,w,h pro Zeile (Annahme!)
+        for tf in sorted(seq_dir.glob("*.txt")):
+            rows = []
+            for line in tf.read_text().splitlines():
+                parts = [p for p in re.split(r"[,\s;]+", line.strip()) if p]
+                rows.append(parts[:4] if len(parts) >= 4 else None)
+            if rows and sum(r is not None for r in rows) >= 0.5 * len(rows):
+                rects, source = rows, tf.name
+                break
+
+    n_ann = len(rects) if rects is not None else 0
+    arr = np.full((n, 4), np.nan)
+    for i in range(min(n, n_ann)):
+        arr[i] = _parse_rect(rects[i])
+    valid = np.isfinite(arr).all(1) & (arr[:, 2] > 0) & (arr[:, 3] > 0)
+
+    ex = np.full(n, np.nan)
+    if exist is not None:
+        m = min(n, len(exist))
+        ex[:m] = np.asarray(exist[:m], dtype=float)
+    exist_flag = np.where(np.isnan(ex), valid, ex > 0)
+
+    return pd.DataFrame({
+        "seq": seq_dir.name, "frame_idx": np.arange(n), "file": [str(p) for p in frames],
+        "exist": exist_flag.astype(bool),
+        "x": arr[:, 0], "y": arr[:, 1], "w": arr[:, 2], "h": arr[:, 3],
+        "valid_box": valid, "n_ann": n_ann, "n_frames": n,
+        "exist_source": "exist" if exist is not None else "abgeleitet_aus_box",
+        "label_source": source,
+    })
+
+
+def _add_derived(df: pd.DataFrame) -> pd.DataFrame:
+    df["has_box"] = df["exist"] & df["valid_box"]
+    df["cx"], df["cy"] = df.x + df.w / 2, df.y + df.h / 2
+    df["area"], df["diag"] = df.w * df.h, np.hypot(df.w, df.h)
+    df["max_side"] = np.maximum(df.w, df.h)
+    lab = np.select([df.diag <= 10, df.diag <= 30, df.diag <= 50], CST_LABELS[:3], CST_LABELS[3])
+    df["size_bin_cst"] = pd.Categorical(np.where(df.has_box, lab, None),
+                                        categories=CST_LABELS, ordered=True)
+    coco = np.select([df.area < 32 ** 2, df.area <= 96 ** 2], ["small", "medium"], "large")
+    df["size_bin_coco"] = np.where(df.has_box, coco, None)
+    return df
+
+
+def build_frame_table(dataset_dir, splits=("train", "val", "test"), cache=None, verbose=True):
+    """Teurer Schritt (liest pro Sequenz nur Labels + 1 Bildheader). Ergebnis cachen!"""
+    if cache is not None and Path(cache).exists():
+        if verbose:
+            print(f"Lade Cache: {cache}")
+        return pd.read_pickle(cache)
+
+    parts = []
+    for split in splits:
+        split_dir = Path(dataset_dir) / split
+        if not split_dir.is_dir():
+            warnings.warn(f"Split-Ordner fehlt: {split_dir}")
+            continue
+        for sd in sorted(p for p in split_dir.iterdir() if p.is_dir()):
+            d = load_sequence_annotations(sd)
+            if d.empty:
+                continue
+            with Image.open(d.file.iloc[0]) as im:
+                d["img_w"], d["img_h"] = im.size
+            d["split"] = split
+            parts.append(d)
+    if not parts:
+        raise RuntimeError(f"Keine Sequenzen unter {dataset_dir} gefunden.")
+    df = _add_derived(pd.concat(parts, ignore_index=True))
+
+    if verbose:
+        names = df.drop_duplicates(["split", "seq"]).groupby("seq").split.nunique()
+        dup = names[names > 1]
+        print(f"{df.seq.nunique()} Sequenzen, {len(df)} Frames, {int(df.has_box.sum())} Boxen")
+        print(f"Aufloesungen: {df.drop_duplicates(['split','seq']).groupby(['img_w','img_h']).size().to_dict()}")
+        print(f"Sequenznamen in mehreren Splits: {len(dup)}" + (f" -> {list(dup.index[:5])}" if len(dup) else ""))
+        mism = df.drop_duplicates(["split", "seq"])
+        mism = mism[mism.n_ann != mism.n_frames]
+        if len(mism):
+            print(f"WARNUNG: {len(mism)} Sequenzen mit n_ann != n_frames (Zuordnung Bild<->Label unsicher)")
+    if cache is not None:
+        Path(cache).parent.mkdir(parents=True, exist_ok=True)
+        df.to_pickle(cache)
+    return df
+
+
+def sample_frames(df, n_per_seq=20, require_box=True):
+    """Deterministisch gleichmaessig ueber jede Sequenz verteilt (jede Sequenz zaehlt gleich,
+    benachbarte Near-Duplicate-Frames werden vermieden)."""
+    src = df[df.has_box] if require_box else df
+    out = []
+    for _, g in src.groupby(["split", "seq"], sort=True):
+        out.append(g.iloc[_even_idx(len(g), n_per_seq)])
+    return pd.concat(out, ignore_index=True)
+
+
+# =============================================================================
+# 2. Tabellen-Messungen (kein Bild-I/O)
+# =============================================================================
+def size_report(df, reference=None, by="split"):
+    """Groessen nach CST-Diagonalen-Klassen (statt COCO-Flaeche) + Stride-Relevanz.
+    `reference`: 'CST-AntiUAV' | 'Anti-UAV410' -> Abgleich mit Paper (nur Plausibilitaet)."""
+    b = df[df.has_box]
+    rows = []
+    for key, g in list(b.groupby(by)) + [("ALL", b)]:
+        row = {by: key, "n_boxen": len(g)}
+        for lab in CST_LABELS:
+            row[f"{lab} (%)"] = 100 * (g.size_bin_cst == lab).mean()
+        row.update({"diag_p10": g.diag.quantile(.1), "diag_med": g.diag.median(),
+                    "diag_p90": g.diag.quantile(.9), "w_med": g.w.median(), "h_med": g.h.median(),
+                    "max_side<=8px (%)": 100 * (g.max_side <= 8).mean(),
+                    "max_side<=4px (%)": 100 * (g.max_side <= 4).mean()})
+        rows.append(row)
+    out = pd.DataFrame(rows).round(2)
+
+    if reference in PAPER_REFERENCE:
+        cnt = b.size_bin_cst.value_counts()
+        print(f"Abgleich mit CST-Paper Table 1 ({reference}); gilt nur bei ALLEN Splits:")
+        for lab in CST_LABELS:
+            ours, ref = int(cnt.get(lab, 0)), PAPER_REFERENCE[reference][lab]
+            print(f"  {lab:7s} ours={ours:7d}  paper={ref:7d}  Abw.={100*(ours-ref)/ref:+6.1f}%")
+    return out
+
+
+def presence_report(df):
+    """Negativframes, Label-Konsistenz, Abwesenheitsphasen pro Split."""
+    rows = []
+    for split, g in df.groupby("split"):
+        per_seq = g.groupby("seq")
+        longest = per_seq.exist.apply(lambda s: _longest_false_run(s.to_numpy()))
+        n_present = per_seq.exist.sum()
+        seq_meta = g.drop_duplicates("seq")
+        rows.append({
+            "split": split, "n_seq": g.seq.nunique(), "n_frames": len(g),
+            "mit_ziel (%)": 100 * g.exist.mean(), "ohne_ziel (%)": 100 * (1 - g.exist.mean()),
+            "seq_ohne_ziel": int((n_present == 0).sum()), "seq_immer_ziel": int((n_present == per_seq.size()).sum()),
+            "laengste_abwesenheit_med": float(longest.median()), "laengste_abwesenheit_max": int(longest.max()),
+            "exist=1_ohne_gueltige_box": int((g.exist & ~g.valid_box).sum()),
+            "box_ohne_exist": int((~g.exist & g.valid_box).sum()),
+            "seq_mit_label_laengen_mismatch": int((seq_meta.n_ann != seq_meta.n_frames).sum()),
+            "exist_aus_box_abgeleitet (seq)": int((seq_meta.exist_source != "exist").sum()),
+        })
+    return pd.DataFrame(rows).round(2)
+
+
+def _longest_false_run(mask) -> int:
+    best = cur = 0
+    for e in mask:
+        cur = 0 if e else cur + 1
+        best = max(best, cur)
+    return best
+
+
+def iou_sensitivity_table(df, shifts=(1.0, 2.0)):
+    """Wie stark bricht der IoU bei s px Fehler ein? Entscheidet, ob AP@0.75/AP50:95 fuer
+    deine Boxgroessen ueberhaupt aussagekraeftig ist.
+      shift: Box um (s,s) verschoben | edge: Box in Breite+Hoehe um s px zu gross."""
+    b = df[df.has_box]
+    w, h = b.w.to_numpy(float), b.h.to_numpy(float)
+    rows = []
+    for s in shifts:
+        inter = np.clip(w - s, 0, None) * np.clip(h - s, 0, None)
+        vals = {f"shift_{s:g}px": inter / (2 * w * h - inter),
+                f"edge_{s:g}px": (w * h) / ((w + s) * (h + s))}
+        for name, v in vals.items():
+            tmp = pd.DataFrame({"bin": b.size_bin_cst.to_numpy(), "iou": v})
+            for lab, gg in tmp.groupby("bin", observed=False):
+                if len(gg):
+                    rows.append({"groesse": lab, "stoerung": name, "n": len(gg),
+                                 "iou_median": gg.iou.median(),
+                                 "anteil_iou<0.75 (%)": 100 * (gg.iou < .75).mean(),
+                                 "anteil_iou<0.5 (%)": 100 * (gg.iou < .5).mean()})
+    return pd.DataFrame(rows).round(3)
+
+
+def yolo_scale_report(df, imgsz=640, factors=(1.0, 0.75, 0.5, 0.25), thresholds=(4, 8, 16), by="split"):
+    """Effektive Boxgroesse nach Letterbox auf `imgsz` (laengste Seite -> imgsz).
+    `factors` = hypothetische ZUSATZ-Skalierung (z.B. durch Mosaic/scale). Die tatsaechlichen
+    Faktoren in Ultralytics musst du im Code nachlesen, sie sind hier nicht abgeleitet."""
+    b = df[df.has_box]
+    eff0 = b.max_side.to_numpy() * imgsz / np.maximum(b.img_w, b.img_h).to_numpy()
+    keys = b[by].to_numpy()
+    rows = []
+    for key in list(pd.unique(keys)) + ["ALL"]:
+        sel = np.ones(len(b), bool) if key == "ALL" else keys == key
+        for f in factors:
+            e = eff0[sel] * f
+            row = {by: key, "zusatzfaktor": f, "max_side_med_px": np.median(e)}
+            for t in thresholds:
+                row[f"<{t}px (%)"] = 100 * (e < t).mean()
+            rows.append(row)
+    return pd.DataFrame(rows).round(2)
+
+
+def temporal_redundancy_report(df):
+    """Wie redundant sind benachbarte Frames? Nur Messung, keine temporale Modellierung.
+    size_jitter = obere Schranke fuer Annotationsrauschen (echte Groessenaenderung ist bei 25 fps klein)."""
+    b = df[df.has_box].sort_values(["split", "seq", "frame_idx"]).copy()
+    g = b.groupby(["split", "seq"])
+    b["dframe"] = g.frame_idx.diff()
+    b["disp"] = np.hypot(g.cx.diff(), g.cy.diff())
+    b["dsize"] = g.diag.diff().abs() / g.diag.shift(1)
+    cons = b[b.dframe == 1]
+    per_seq = cons.groupby(["split", "seq"]).agg(
+        n_paare=("disp", "size"), disp_med_px=("disp", "median"),
+        still_anteil=("disp", lambda s: float((s < 1).mean())),
+        size_jitter_med=("dsize", "median")).reset_index()
+    summary = []
+    for split, c in cons.groupby("split"):
+        summary.append({"split": split, "n_paare": len(c), "disp_med_px": c.disp.median(),
+                        "paare_disp<1px (%)": 100 * (c.disp < 1).mean(),
+                        "paare_disp<2px (%)": 100 * (c.disp < 2).mean(),
+                        "size_jitter_med": c.dsize.median(), "size_jitter_p90": c.dsize.quantile(.9)})
+    return per_seq, pd.DataFrame(summary).round(3)
+
+
+# =============================================================================
+# 3. Pixel-Messungen (nur auf Stichprobe `sample_frames`)
+# =============================================================================
+def measure_target_contrast(sample, d=20, gap=2, hud_rows=None, sigma_floor=1.0):
+    """Lokaler Kontrast je Ziel (Variante des SCR aus PGDA, Gl. 2, aber mit VORZEICHEN).
+    Hintergrund = Fenster +-d px um die Box ohne Box+gap, HUD-Zeilen (< hud_rows) ausgeschlossen.
+    scr_peak   = (max(Box)  - mu_b) / sigma_b     (hell)
+    scr_trough = (mu_b - min(Box)) / sigma_b      (dunkel)
+    scr_extreme = max(beide); polarity = welche der beiden groesser ist.
+    ACHTUNG: PGDA nutzt den Mittelwert ueber Zielpixel (mit Maske). Hier gibt es keine Masken;
+    der Box-Mittelwert (mu_box/scr_mean) enthaelt Halo/Hintergrund und unterschaetzt den Kontrast."""
+    recs = []
+    for r in sample.itertuples(index=False):
+        img = cv2.imread(r.file, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            recs.append({})
+            continue
+        H, W = img.shape
+        (x0, y0, x1, y1), c = _box_int(r, W, H)
+        if c is None:
+            recs.append({})
+            continue
+        box = img[c[1]:c[3], c[0]:c[2]].astype(np.float32)
+        wx0, wy0, wx1, wy1 = max(x0 - d, 0), max(y0 - d, 0), min(x1 + d, W), min(y1 + d, H)
+        win = img[wy0:wy1, wx0:wx1].astype(np.float32)
+        mask = np.ones(win.shape, bool)
+        mask[max(y0 - gap, 0) - wy0:min(y1 + gap, H) - wy0, max(x0 - gap, 0) - wx0:min(x1 + gap, W) - wx0] = False
+        if hud_rows and hud_rows - wy0 > 0:
+            mask[:hud_rows - wy0, :] = False
+        bg = win[mask]
+        if bg.size < 30:
+            recs.append({})
+            continue
+        mu_b, sd_b = float(bg.mean()), max(float(bg.std()), sigma_floor)
+        peak, trough, mu_box = float(box.max()), float(box.min()), float(box.mean())
+        sp, st = (peak - mu_b) / sd_b, (mu_b - trough) / sd_b
+        recs.append({"mu_box": mu_box, "peak": peak, "mu_b": mu_b, "sigma_b": sd_b,
+                     "scr_mean": (mu_box - mu_b) / sd_b, "scr_peak": sp, "scr_trough": st,
+                     "scr_extreme": max(sp, st), "polarity": "hell" if sp >= st else "dunkel",
+                     "delta_gray": (peak - mu_b) if sp >= st else (trough - mu_b),
+                     "saturated": peak >= 250, "n_bg_px": int(bg.size),
+                     "in_hud_band": bool(hud_rows and y0 < hud_rows)})
+    return pd.concat([sample.reset_index(drop=True), pd.DataFrame(recs)], axis=1)
+
+
+def contrast_report(cdf, by=("split", "size_bin_cst"), min_scr=3.0):
+    """Polaritaet und Trennbarkeit. `min_scr`: darunter ist das Ziel lokal kaum vom Rauschen
+    trennbar (Faustwert: Maximum von ~50 Rauschpixeln liegt bei ~2.3 sigma; Schwelle ist Annahme)."""
+    rows = []
+    for key, g in cdf.dropna(subset=["scr_extreme"]).groupby(list(by), observed=False):
+        if not len(g):
+            continue
+        key = key if isinstance(key, tuple) else (key,)
+        rows.append({**dict(zip(by, key)), "n": len(g),
+                     "dunkel (%)": 100 * (g.polarity == "dunkel").mean(),
+                     f"scr_extreme<{min_scr:g} (%)": 100 * (g.scr_extreme < min_scr).mean(),
+                     "scr_peak_p10": g.scr_peak.quantile(.1), "scr_peak_med": g.scr_peak.median(),
+                     "scr_peak_p90": g.scr_peak.quantile(.9), "delta_gray_med": g.delta_gray.median(),
+                     "sigma_b_med": g.sigma_b.median(), "saturiert (%)": 100 * g.saturated.mean()})
+    return pd.DataFrame(rows).round(2)
+
+
+def measure_distractors(sample, blur_sigma=1.0, win=31, z_thr=3.0, nms_k=5, exclude_pad=3, border=2, hud_rows=None):
+    """Zielaehnliche Hintergrund-Blobs auf einer z-Score-Karte
+         z_hell  = (Gauss_sigma(img) - Mittel_win(img)) / Std_win(img)      z_dunkel = -z_hell
+    = dieselbe Idee wie scr_peak/scr_trough (Spitze gegen lokalen Hintergrund), fuer JEDEN Pixel, mit leichter
+    Glaettung gegen Pixelrauschen. Es wird die Polaritaet des GT-Ziels verwendet (dunkles Ziel -> dunkle Blobs);
+    Frames ohne Box: nur helle Blobs. Kandidaten = lokale Maxima mit z > z_thr ausserhalb Box (+exclude_pad),
+    Rand und HUD-Zeilen. gt_z = hoechster z-Wert in der Box; gt_rank = 1 + Anzahl staerkerer Kandidaten.
+    gt_rank gilt nur fuer Boxen mit max_side <= win/3 (sonst dominiert das Ziel Fenstermittel/-std), sonst NaN.
+    Kalibrierung (z_thr, win, blur_sigma) ist eine ANNAHME: an einigen Frames per Sichtpruefung validieren."""
+    nms = np.ones((nms_k, nms_k), np.uint8)
+    recs = []
+    for r in sample.itertuples(index=False):
+        img = cv2.imread(r.file, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            recs.append({})
+            continue
+        H, W = img.shape
+        f = img.astype(np.float32)
+        g = cv2.GaussianBlur(f, (0, 0), blur_sigma) if blur_sigma > 0 else f
+        m = cv2.boxFilter(f, -1, (win, win), borderType=cv2.BORDER_REFLECT)
+        m2 = cv2.boxFilter(f * f, -1, (win, win), borderType=cv2.BORDER_REFLECT)
+        sd = np.maximum(np.sqrt(np.maximum(m2 - m * m, 0)), 1.0)
+        z = (g - m) / sd
+        c, pol = None, "hell"
+        if bool(getattr(r, "has_box", False)):
+            _, c = _box_int(r, W, H)
+            if c is not None and (-z)[c[1]:c[3], c[0]:c[2]].max() > z[c[1]:c[3], c[0]:c[2]].max():
+                z, pol = -z, "dunkel"
+        peaks = (z == cv2.dilate(z, nms)) & (z > z_thr)
+        peaks[:border, :] = peaks[-border:, :] = False
+        peaks[:, :border] = peaks[:, -border:] = False
+        if hud_rows:
+            peaks[:hud_rows, :] = False
+        ys, xs = np.nonzero(peaks)
+        vals = z[ys, xs]
+        rec = {"n_cand_total": int(len(xs)), "cand_polarity": pol}
+        if c is not None:
+            inside = ((xs >= c[0] - exclude_pad) & (xs < c[2] + exclude_pad) &
+                      (ys >= c[1] - exclude_pad) & (ys < c[3] + exclude_pad))
+            gt_z = float(z[c[1]:c[3], c[0]:c[2]].max())
+            rec.update({"n_cand": int((~inside).sum()), "gt_z": gt_z, "gt_detectable": gt_z > z_thr})
+            if max(r.w, r.h) <= win / 3:
+                nb = int((vals[~inside] > gt_z).sum())
+                rec.update({"n_brighter": nb, "gt_rank": nb + 1})
+        else:
+            rec["n_cand"] = int(len(xs))
+        recs.append(rec)
+    return pd.concat([sample.reset_index(drop=True), pd.DataFrame(recs)], axis=1)
+
+
+def distractor_report(ddf, by=("split", "size_bin_cst")):
+    rows = []
+    for key, g in ddf.dropna(subset=["gt_rank"]).groupby(list(by), observed=False):
+        if not len(g):
+            continue
+        key = key if isinstance(key, tuple) else (key,)
+        rows.append({**dict(zip(by, key)), "n": len(g), "kandidaten_med": g.n_cand.median(),
+                     "kandidaten_mean": g.n_cand.mean(), "gt_z_med": g.gt_z.median(),
+                     "ziel_staerkster_blob (%)": 100 * (g.gt_rank == 1).mean(),
+                     "rang_med": g.gt_rank.median(), "rang_p90": g.gt_rank.quantile(.9),
+                     "ziel_unter_z_thr (%)": 100 * (~g.gt_detectable.astype(bool)).mean()})
+    return pd.DataFrame(rows).round(2)
+
+
+def measure_frame_stats(sample, hud_rows=None):
+    """Globale Bildstatistik je Frame; edge_density dient als Proxy fuer Hintergrundkomplexitaet."""
+    recs = []
+    for r in sample.itertuples(index=False):
+        img = cv2.imread(r.file, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            recs.append({})
+            continue
+        v = img[hud_rows:, :] if hud_rows else img
+        f = v.astype(np.float32)
+        gx, gy = cv2.Sobel(f, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(f, cv2.CV_32F, 0, 1, ksize=3)
+        recs.append({"g_mean": float(f.mean()), "g_std": float(f.std()),
+                     "g_p99": float(np.percentile(f, 99)),
+                     "edge_density": float(np.hypot(gx, gy).mean())})
+    return pd.concat([sample.reset_index(drop=True), pd.DataFrame(recs)], axis=1)
+
+
+def assign_clutter_class(stats, col="edge_density", ref="train", labels=("ruhig", "mittel", "unruhig")):
+    """Terzil-Schwellen nur aus `ref`-Split (kein Leakage), dann auf alle Splits angewandt.
+    Zweck: spaeter Ergebnisse nach Hintergrundkomplexitaet aufschluesseln (statt Masken)."""
+    q1, q2 = stats.loc[stats.split == ref, col].quantile([1 / 3, 2 / 3])
+    stats = stats.copy()
+    stats["clutter_class"] = np.select([stats[col] <= q1, stats[col] <= q2], labels[:2], labels[2])
+    print(f"Schwellen aus '{ref}': {q1:.3f} / {q2:.3f}")
+    return stats
+
+
+# =============================================================================
+# 4. HUD/Overlay (ergaenzt find_text_in_seq mit Pixel-Ausdehnung)
+# =============================================================================
+def estimate_overlay(seq_dir, n_frames=30, std_thresh=2.0, extreme=(20, 235), row_frac=0.02, min_cov=0.002):
+    """Statische Extremwert-Pixel (zeitlich konstant UND nahe 0/255) = Overlay-Kandidaten.
+    HEURISTIK: bei statischer Kamera mit gesaettigten/schwarzen Flaechen Falsch-Positive moeglich;
+    gegen EAST-Ergebnis validieren (`reference_seq_names` in overlay_report)."""
+    frames = _list_frames(Path(seq_dir))
+    if len(frames) < 5:
+        return None
+    imgs = [cv2.imread(str(frames[i]), cv2.IMREAD_GRAYSCALE) for i in _even_idx(len(frames), n_frames)]
+    stack = np.stack([i for i in imgs if i is not None]).astype(np.float32)
+    std, med = stack.std(0), np.median(stack, 0)
+    st = (std < std_thresh) & ((med >= extreme[1]) | (med <= extreme[0]))
+    rows = np.nonzero(st.mean(1) > row_frac)[0]
+    cov = float(st.mean())
+    return {"seq": Path(seq_dir).name, "coverage (%)": 100 * cov, "has_overlay": cov >= min_cov,
+            "row_min": int(rows.min()) if len(rows) else np.nan,
+            "row_max": int(rows.max()) if len(rows) else np.nan, "n_frames_used": len(stack)}
+
+
+def overlay_report(dataset_dir, splits=("train", "val", "test"), reference_seq_names=None, **kw):
+    """Pro Sequenz Overlay-Ausdehnung. `row_max` (z.B. 95. Perzentil) liefert datenbasiert `hud_rows`
+    statt der festen 96. `reference_seq_names`: Menge von Sequenznamen aus find_text_in_seq
+    (dort `return all_dirs_set` ergaenzen und Namen via Path(p).name bilden)."""
+    rows = []
+    for split in splits:
+        sdir = Path(dataset_dir) / split
+        for sd in sorted(p for p in sdir.iterdir() if p.is_dir()) if sdir.is_dir() else []:
+            r = estimate_overlay(sd, **kw)
+            if r:
+                r["split"] = split
+                rows.append(r)
+    out = pd.DataFrame(rows)
+    if reference_seq_names is not None and len(out):
+        out["east_overlay"] = out.seq.isin(reference_seq_names)
+        print("Abgleich Heuristik vs. EAST (Zeilen: EAST, Spalten: Heuristik):")
+        print(pd.crosstab(out.east_overlay, out.has_overlay))
+    if len(out):
+        print(out.groupby("split").agg(seq=("seq", "size"), overlay_anteil=("has_overlay", "mean"),
+                                       row_max_p95=("row_max", lambda s: s.quantile(.95))).round(3))
+    return out
+
+
+def hud_overlap_report(df, hud_rows=96, overlay_df=None):
+    """Anteil der GT-Boxen, die in das Overlay-Band ragen (ersetzt den mit '# Over 96' beschrifteten Zaehler,
+    der tatsaechlich y<=96 zaehlt). Mit overlay_df nur Sequenzen mit erkanntem Overlay."""
+    b = df[df.has_box]
+    if overlay_df is not None:
+        keep = overlay_df.loc[overlay_df.has_overlay, ["split", "seq"]]
+        b = b.merge(keep, on=["split", "seq"])
+    rows = [{"split": s, "n_boxen": len(g), f"oberkante<{hud_rows} (%)": 100 * (g.y < hud_rows).mean(),
+             f"komplett_in_band (%)": 100 * ((g.y + g.h) <= hud_rows).mean()} for s, g in b.groupby("split")]
+    return pd.DataFrame(rows).round(2)
+
+
+def channel_and_range_report(df, n=300, seed=0):
+    """Sind die JPGs 3-Kanal-Replikate von Graubildern? Wie viele Graustufen, wie viel Saettigung?
+    Relevant fuer HSV-Augmentierung und fuer den Maximalwert eingefuegter Ziele."""
+    files = df.file.drop_duplicates()
+    files = files.sample(min(n, len(files)), random_state=seed)
+    rows = []
+    for f in files:
+        im = cv2.imread(f, cv2.IMREAD_UNCHANGED)
+        if im is None:
+            continue
+        ch = 1 if im.ndim == 2 else im.shape[2]
+        g = im if ch == 1 else im[..., 0]
+        diff = 0 if ch == 1 else int(max(np.abs(im[..., 0].astype(int) - im[..., k]).max() for k in range(1, ch)))
+        rows.append({"dtype": str(im.dtype), "kanaele": ch, "max_kanal_diff": diff, "n_stufen": len(np.unique(g)),
+                     "sat_255 (%)": 100 * float((g >= 255).mean()), "sat_0 (%)": 100 * float((g <= 0).mean()),
+                     "min": int(g.min()), "max": int(g.max())})
+    out = pd.DataFrame(rows)
+    if len(out):
+        print(out.groupby(["dtype", "kanaele"]).agg(n=("min", "size"), max_kanal_diff=("max_kanal_diff", "max"),
+                                                    stufen_med=("n_stufen", "median"),
+                                                    sat255_med=("sat_255 (%)", "median")).round(3))
+    return out
+
+
+# =============================================================================
+# 5. Split-Qualitaet
+# =============================================================================
+def split_shift_report(table, columns, ref="train", split_col="split", seq_col="seq"):
+    """Verteilungsunterschied ref-Split vs. andere, aggregiert pro SEQUENZ (Median), weil Frames
+    innerhalb einer Sequenz nicht unabhaengig sind. Bewusst KEINE p-Werte.
+    ks in [0,1]; w1_rel = Wasserstein-1 / Std(ref), grob: >0.3 deutliche Verschiebung (Faustwert)."""
+    per_seq = table.groupby([split_col, seq_col])[list(columns)].median().reset_index()
+    rows = []
+    for col in columns:
+        a = per_seq.loc[per_seq[split_col] == ref, col].dropna().to_numpy()
+        for sp in [s for s in per_seq[split_col].unique() if s != ref]:
+            b = per_seq.loc[per_seq[split_col] == sp, col].dropna().to_numpy()
+            row = {"merkmal": col, "vergleich": f"{ref} vs {sp}", "n_seq_ref": len(a), "n_seq_other": len(b)}
+            if len(a) < 3 or len(b) < 3:
+                rows.append({**row, "ks": np.nan, "w1": np.nan, "w1_rel": np.nan, "hinweis": "zu wenige Sequenzen (<3)"})
+                continue
+            w1 = _w1(a, b)
+            rows.append({**row, "ks": _ks(a, b), "w1": w1, "w1_rel": w1 / (a.std() + 1e-9), "hinweis": ""})
+    return pd.DataFrame(rows).round(3)
+
+
+def _fingerprint(seq_dir, n_frames, thumb, crop_top):
+    frames = _list_frames(Path(seq_dir))
+    idx = _even_idx(len(frames), n_frames)
+    thumbs = []
+    for i in idx:
+        im = cv2.imread(str(frames[i]), cv2.IMREAD_GRAYSCALE)
+        if im is None:
+            continue
+        im = im[crop_top:, :] if crop_top else im
+        thumbs.append(cv2.resize(im, thumb, interpolation=cv2.INTER_AREA).astype(np.float32))
+    fp = np.median(np.stack(thumbs), 0)  # Median ueber Frames unterdrueckt das bewegte Ziel
+    fp = (fp - fp.mean()) / (fp.std() + 1e-6)
+    return fp.ravel(), str(frames[idx[len(idx) // 2]])
+
+
+def cross_split_near_duplicates(dataset_dir, splits=("train", "val", "test"), ref="train",
+                                n_frames=8, thumb=(48, 40), crop_top=96, pair_pct=5.0):
+    """Szenen-Overlap zwischen Splits per Hintergrund-Fingerabdruck (Median-Thumbnail, Korrelationsdistanz).
+    Schwelle = `pair_pct`-Perzentil ALLER ref-ref-Paardistanzen. Eine Query-Sequenz gilt als 'szene_geteilt',
+    wenn ihre naechste ref-Sequenz naeher liegt als diese Schwelle. Vergleichsbasis: Anteil der
+    ref-Sequenzen, deren naechster ref-Nachbar (leave-one-out) unter derselben Schwelle liegt.
+    Ist der val/test-Anteil aehnlich hoch wie der ref-interne, sind die Splits szenisch nicht unabhaengig.
+    HEURISTIK: bei bewegter Kamera aendert sich der Hintergrund, Aussagekraft eingeschraenkt.
+    Schwelle/Perzentil ist eine Annahme -> Top-Paare (query_frame/ref_frame) IMMER visuell pruefen."""
+    fps, meta = {}, []
+    for split in splits:
+        sdir = Path(dataset_dir) / split
+        if not sdir.is_dir():
+            continue
+        for sd in sorted(p for p in sdir.iterdir() if p.is_dir()):
+            if len(_list_frames(sd)) < 2:
+                continue
+            fp, mid = _fingerprint(sd, n_frames, thumb, crop_top)
+            fps[(split, sd.name)] = fp
+            meta.append({"split": split, "seq": sd.name, "frame": mid})
+    meta = pd.DataFrame(meta)
+    F = np.stack([fps[(r.split, r.seq)] for r in meta.itertuples()])
+    ridx = np.nonzero((meta.split == ref).to_numpy())[0]
+    if len(ridx) < 5:
+        warnings.warn(f"Nur {len(ridx)} ref-Sequenzen: Perzentil-Schwelle kaum belastbar.")
+    D = 1.0 - (F @ F[ridx].T) / F.shape[1]
+    drr = D[ridx].copy()
+    iu = np.triu_indices(len(ridx), k=1)
+    thr = float(np.percentile(drr[iu], pair_pct))
+    np.fill_diagonal(drr, np.inf)
+    nn_ref = drr.min(1)
+    rows = []
+    for i, r in enumerate(meta.itertuples()):
+        if r.split == ref:
+            continue
+        j = int(D[i].argmin())
+        rows.append({"split": r.split, "seq": r.seq, "naechste_ref_seq": meta.seq[ridx[j]],
+                     "dist": float(D[i, j]), "dist_ratio_zu_schwelle": float(D[i, j] / thr),
+                     "szene_geteilt?": bool(D[i, j] <= thr), "query_frame": r.frame, "ref_frame": meta.frame[ridx[j]]})
+    out = pd.DataFrame(rows).sort_values("dist").reset_index(drop=True)
+    print(f"Schwelle = {pair_pct:g}. Perzentil aller {ref}-{ref}-Paare = {thr:.4f}")
+    print(f"  {ref} (leave-one-out): {100 * np.mean(nn_ref <= thr):.1f} % der Sequenzen unter Schwelle")
+    if len(out):
+        for sp, g in out.groupby("split"):
+            print(f"  {sp}: {100 * g['szene_geteilt?'].mean():.1f} % unter Schwelle (n={len(g)})")
+    return out
