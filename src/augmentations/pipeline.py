@@ -34,17 +34,12 @@ class IREffect:
 
 # Name used in the config (after "ir.") -> implementation.
 IR_EFFECTS: dict[str, IREffect] = {
-    "netd": IREffect(ir.netd_augmentation),
-    "fpn_corruption": IREffect(ir.simulate_fpn_corruption),
-    "common_mode_noise": IREffect(ir.add_common_mode_noise, unit_range=True),
+    "netd": IREffect(ir.netd_noise),
     "histogram_shift": IREffect(ir.thermal_histogram_shift),
     "histogram_compression": IREffect(ir.thermal_histogram_compression),
     "fpn": IREffect(ir.fpn),
-    "fpn2": IREffect(ir.fpn2),
-    "salt_and_pepper": IREffect(ir.salt_and_peper, unit_range=True),
-    "motion_blur": IREffect(ir.motion_blur),
+    "salt_and_pepper": IREffect(ir.salt_and_peper),
     "psf_blur": IREffect(ir.blurring_with_psf),
-    "stripe_noise": IREffect(ir.stripe_noise),
 }
 
 

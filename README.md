@@ -92,10 +92,12 @@ DATASETS = [DatasetName.CST_ANTI_UAV]                               # only one
   if there are several, over all of them together. Notebooks 01 and 02 work this way.
 - `AntiUAVDataset(DATASETS, split="train")` loads the frames of all selected datasets in
   that order. The loading cell prints the index range of each dataset.
-- `03_augmentation.ipynb` tries the augmentations on one frame (`IMAGE_ID`): the Albumentations
-  pipeline, the IR sensor effects, and a slider for the global intensity shift (`intensity_shift`;
-  in training it is `ir.histogram_shift` with a random delta). `04_parameter.ipynb` has sliders
-  for the other IR effects.
+- `03_augmentation.ipynb` tests augmentation pipelines exactly as training builds them: config
+  entries -> `build_albumentations`, shown on one frame (`IMAGE_ID`) with several random variants
+  and a zoom on the target. It covers single IR effects, a combination, and the `augmentation:`
+  section of a run config.
+- `04_parameter.ipynb` has sliders for the parameter ranges of the single effects
+  (NETD noise, FPN / stripe noise, optical / motion blur, ...).
 - `06_measure.ipynb` measures the data before choosing augmentations: sizes, presence, contrast (SCR),
   distractors, clutter, HUD band and split overlap. Each section first defines its functions, then
   applies them. `per_dataset(report, df)` gives one table with each dataset and the combination.

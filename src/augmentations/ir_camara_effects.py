@@ -4,106 +4,37 @@ from scipy.signal import convolve2d
 
 
 
-def netd_augmentation(image, min_sigma=2.0, max_sigma=16.0, alpha_range=(0.65, 0.95)):
+def netd_noise(image, sigma=0.0):
     """
-    Simuliert unterschiedliche NETD-Qualitäten für TIR-Bilder im Wertebereich [0, 255] (NumPy).
-    
-    Parameters:
-    - image: np.ndarray im Bereich [0, 255], Shape: (H, W) oder (H, W, C)
-    - min_sigma / max_sigma: Standardabweichung des Gauß-Rauschens (direkt auf 0-255 Skala)
-    - contrast_range: Steuert den Kontrastverlust
+    NETD-ähnliches Rauschen (Borovskikh et al. 2026):
+        T_noise(x, y) = T_ref(x, y) + eta(x, y),   eta ~ N(0, sigma_T^2)
+    eta wird für jedes Pixel und bei jedem Aufruf (= jedem Frame) neu gezogen, Mittelwert 0.
+
+    sigma: Standardabweichung relativ zum vollen Wertebereich [0, 1] (bei 8 bit: sigma * 255 Grauwerte).
+           Größeres sigma = weniger empfindliche (z.B. günstige) Kamera.
+    image: Ganzzahl-Bild (z.B. uint8, Wertebereich 0..dtype-Max) oder Float-Bild in [0, 1].
+           Rückgabe im selben dtype, auf den Wertebereich geclippt.
     """
-    # Kopie erstellen und zu float32 konvertieren (wichtig für saubere Rausch- und Kontrastberechnung)
-    augmented = image.copy().astype(np.float32)
-    
-    # 1. Kontrast- und Dynamikreduktion (Simuliert sinkenden thermischen Kontrast)
-    alpha = np.random.uniform(alpha_range[0], alpha_range[1])
-    mean = augmented.mean()
-    augmented = mean + alpha * (augmented - mean)
-    
-    # 2. Gaußsches Rauschen (Simuliert das thermische Eigenrauschen des Sensors / NETD)
-    sigma = np.random.uniform(min_sigma, max_sigma)
-    noise = np.random.normal(0.0, sigma, augmented.shape)
-    augmented = augmented + noise
+    image = np.asarray(image)
+    integer = np.issubdtype(image.dtype, np.integer)
+    scale = float(np.iinfo(image.dtype).max) if integer else 1.0
 
-    # Sicherstellen, dass die Werte im gültigen Bereich [0, 255] bleiben
-    return np.clip(augmented, 0.0, 255.0)
+    eta = np.random.normal(0.0, sigma * scale, image.shape)
+    noisy = np.clip(image.astype(np.float32) + eta, 0.0, scale)
 
-def simulate_fpn_corruption(clean_image, alpha=1.0, noise_type='laplace'):
-    """
-    Simuliert FPN-Korruption exakt nach dem Signalmodell aus Song & Huang (2023):
-    Y = X + alpha * M
-    
-    Parameter:
-    - clean_image: Das saubere Eingangsbild (z.B. Grauwertbild aus Dataset)
-    - alpha: Skalierungsparameter für das FPN (abhängig von Temperatur/Belichtung)
-    - noise_type: 'gaussian', 'laplace' (wichtig wegen 'Hot Pixels') oder 'uniform'
-    """
+    if integer:
+        noisy = np.rint(noisy)
+    return noisy.astype(image.dtype)
 
-    # Sicherstellen, dass das Bild im Float-Format vorliegt
-    img_float = clean_image.astype(np.float32)
-    h, w = img_float.shape[:2]
-    
-    # 1. Noise Pattern M basierend auf den im Paper genannten Verteilungen generieren
-    if noise_type == 'gaussian':
-        M = np.random.normal(loc=0.0, scale=1.0, size=(h, w))
-    elif noise_type == 'laplace':
-        # Laplace eignet sich besonders gut für FPN, da es "Heavy Tails" 
-        # und damit realistische "Hot Pixels" simuliert (siehe Paper Abschnitt V)
-        M = np.random.laplace(loc=0.0, scale=1.0 / np.sqrt(2), size=(h, w))
-    elif noise_type == 'uniform':
-        M = np.random.uniform(low=-np.sqrt(3), high=np.sqrt(3), size=(h, w))
-    else:
-        raise ValueError(f"Unbekannter Rauschtyp: {noise_type}")
-        
-    # Varianz des Noise Patterns auf 1 normieren (wie im Paper beschrieben)
-    M = M / np.std(M)
-    
-    # 2. Lineares Signalmodell anwenden: Y = X + alpha * M
-    noisy_image = img_float + alpha * M
-    
-    # Auf gültigen Bereich [0, 255] clippen
-    noisy_image = np.clip(noisy_image, 0, 255)
-    
-    return noisy_image.astype(np.uint8), M
-
-
-def add_common_mode_noise(image, row_noise_level=0.03, col_noise_level=0.01):
-    """
-    Fügt einem Bild (z.B. normalisiert auf [0, 1]) Common Mode Noise 
-    in Form von Zeilen- und Spaltenstreifen hinzu.
-    """
-    h, w = image.shape[:2]
-    noisy_img = image.copy()
-    
-    # 1. Zeilenrauschen (Row Noise): 
-    # Ein Rauschwert pro Zeile, der über alle Spalten gezogen wird.
-    row_noise = np.random.normal(0, row_noise_level, (h, 1))
-    
-    # 2. Spaltenrauschen (Column Noise):
-    # Ein Rauschwert pro Spalte, der über alle Zeilen gezogen wird.
-    col_noise = np.random.normal(0, col_noise_level, (1, w))
-        
-    noisy_img = noisy_img + row_noise + col_noise
-    
-    # 3. Optional: Globales Frame-Flicker (Gesamthelligkeit schwankt leicht)
-    global_flicker = np.random.normal(0, 0.02)
-    noisy_img = noisy_img + global_flicker
-    
-    # Wertebereich absichern
-    return np.clip(noisy_img, 0.0, 1.0)
-
-
-def intensity_shift(image, delta, g_max=255):
+def intensity_shift(image, delta):
     """
     Globaler Intensitäts-Shift (deterministisch):
-    Y_tilde = Clip(Y + delta, 0, G_max)
+    Y_tilde = Clip(Y + delta, 0, 255)
     Alle Grauwerte werden um denselben Betrag verschoben (globale Temperatur-Drift).
-    Werte, die über 0 / G_max hinausgehen, sättigen; dort geht Kontrast verloren.
+    Werte, die über 0 / 255 hinausgehen, sättigen; dort geht Kontrast verloren.
     """
     shifted = image.astype(np.float32) + float(delta)
-    return np.clip(shifted, 0, g_max).astype(np.uint8)
-
+    return np.clip(shifted, 0, 255).astype(np.uint8)
 
 def thermal_histogram_shift(image, delta_limit=30):
     """
@@ -113,7 +44,6 @@ def thermal_histogram_shift(image, delta_limit=30):
     """
     delta_g = np.random.uniform(-delta_limit, delta_limit)
     return intensity_shift(image, delta_g)
-
 
 def thermal_histogram_compression(image, gamma_min=0.3, gamma_max=0.9):
     """
@@ -141,107 +71,31 @@ def thermal_histogram_compression(image, gamma_min=0.3, gamma_max=0.9):
 ######################################################################################
 
 
-def fpn2(img, prnu=None, dcnu=None, n_random=None, 
-                         sigma_prnu=0.01, dcnu_mean=0.0, dcnu_std=2.0, 
-                         read_noise_std=1.0):
-    """
-    Simulates a noisy image using the standard sensor noise model:
-    I_noisy(i,j) = [I_clean(i,j) * (1 + PRNU(i,j))] + DCNU(i,j) + N_random(i,j)
-    
-    Parameters:
-    -----------
-    I_clean : ndarray
-        The true incoming irradiance/signal image.
-    prnu : ndarray, optional
-        Multiplicative Photo-Response Non-Uniformity map. If None, 
-        generated as a zero-mean Gaussian field.
-    dcnu : ndarray, optional
-        Additive Dark Current Non-Uniformity map. If None, 
-        generated as a spatial Gaussian map.
-    n_random : ndarray, optional
-        Time-varying temporal noise (shot + read noise). If None, 
-        generated using shot noise (Poisson) and Gaussian read noise.
-    sigma_prnu : float
-        Standard deviation for PRNU (default 0.01 - 0.02).
-    dcnu_mean, dcnu_std : float
-        Parameters for generating synthetic DCNU if not provided.
-    read_noise_std : float
-        Standard deviation for temporal read noise.
-        
-    Returns:
-    --------
-    I_noisy : ndarray
-        The resulting simulated noisy image.
-    """
-    shape = img.shape
-    
-    # 1. Multiplicative PRNU component
-    if prnu is None:
-        # Zero-mean Gaussian field with small standard deviation
-        prnu = np.random.normal(loc=0.0, scale=sigma_prnu, size=shape)
-        
-    # 2. Additive DCNU component
-    if dcnu is None:
-        # Modeled as a spatial Gaussian or offset map
-        dcnu = np.random.normal(loc=dcnu_mean, scale=dcnu_std, size=shape)
-        
-    # 3. Time-varying temporal noise N_random (Shot noise + Read noise)
-    if n_random is None:
-        # Shot noise depends on the signal magnitude (Poissonian approximation)
-        # For general signals, we can simulate shot noise or use a normal approximation
-        shot_noise = np.random.normal(loc=0.0, scale=np.sqrt(np.maximum(img, 0)), size=shape)
-        read_noise = np.random.normal(loc=0.0, scale=read_noise_std, size=shape)
-        n_random = shot_noise + read_noise
-
-    # Apply the full equation
-    I_noisy = (img * (1.0 + prnu)) + dcnu + n_random
-    
-    return I_noisy
-import numpy as np
-
-
 def fpn(img,
             sigma_gain=0.0,       # std of PRNU a(i,j) around 1 (unitless, e.g. 0.01-0.05)
             sigma_offset=0.0,     # std of DSNU b(i,j) around 0 (in intensity units, e.g. 1-5 on 0-255)
-            sigma_noise=0.0,      # std of random noise n(i,j) (intensity units)
-            mode="pixel",         # "pixel", "column" or "row"
-            a=None, b=None,       # optional fixed gain/offset maps (override sigma_gain/sigma_offset)
-            value_range=None,     # (lo, hi) clip range; inferred from dtype if None
-            rng=None,
-            return_maps=False):
+            mode="pixel"):        # "pixel", "column" or "row"
     """
-    Fixed pattern noise model (Eq. 1):  y = a * x + b + n
+    Fixed pattern noise model:  y = a * x + b
 
     a: multiplicative term (PRNU), drawn as N(1, sigma_gain^2)
     b: additive term (DSNU),       drawn as N(0, sigma_offset^2)
-    n: random noise,               drawn as N(0, sigma_noise^2)
 
-    With the default arguments (all sigmas = 0, no maps given) a = 1, b = 0, n = 0,
+    With the default arguments (all sigmas = 0) a = 1, b = 0,
     so the output equals the input.
 
     mode:
         "pixel"  -> independent a, b per pixel (H x W)
-        "column" -> one a, b per column (vertical stripes, typical of uncooled IR readout)
+        "column" -> one a, b per column (vertical stripes, typical of uncooled IR readout).
+                    Stripe noise (Fayyaz et al. 2022) = mode "column" with sigma_gain = 0,
+                    i.e. only an additive offset per column.
         "row"    -> one a, b per row (horizontal stripes)
 
-    FPN is a property of the sensor, so it is the same across frames. To apply
-    the same pattern to several images, pass a and b (use return_maps=True to get them),
-    or reuse an rng seeded identically.
-
-    For multi-channel images the same (a, b) pattern is applied to every channel,
-    while n is drawn independently per element.
+    Integer images are clipped to the range of their dtype; float images are not clipped.
+    For multi-channel images the same (a, b) pattern is applied to every channel.
     """
-    rng = np.random.default_rng() if rng is None else rng
     img = np.asarray(img)
     H, W = img.shape[:2]
-
-    # clip range
-    if value_range is None:
-        if np.issubdtype(img.dtype, np.integer):
-            info = np.iinfo(img.dtype)
-            value_range = (info.min, info.max)
-        else:
-            value_range = None          # float input: no clipping unless requested
 
     def draw(mean, sigma):
         if mode == "pixel":
@@ -254,11 +108,11 @@ def fpn(img,
             raise ValueError("mode must be 'pixel', 'column' or 'row'")
         m = np.full(shape, mean, dtype=np.float32)
         if sigma > 0:
-            m += rng.normal(0.0, sigma, size=shape).astype(np.float32)
+            m += np.random.normal(0.0, sigma, size=shape).astype(np.float32)
         return np.broadcast_to(m, (H, W)).copy()
 
-    a_map = draw(1.0, sigma_gain) if a is None else np.asarray(a, dtype=np.float32)
-    b_map = draw(0.0, sigma_offset) if b is None else np.asarray(b, dtype=np.float32)
+    a_map = draw(1.0, sigma_gain)
+    b_map = draw(0.0, sigma_offset)
 
     x = img.astype(np.float32)
     if x.ndim == 3:
@@ -266,56 +120,50 @@ def fpn(img,
         b_map = b_map[..., None]
 
     y = a_map * x + b_map
-    if sigma_noise > 0:
-        y += rng.normal(0.0, sigma_noise, size=x.shape).astype(np.float32)
 
-    if value_range is not None:
-        y = np.clip(y, *value_range)
     if np.issubdtype(img.dtype, np.integer):
-        y = np.rint(y)
-    y = y.astype(img.dtype)
+        info = np.iinfo(img.dtype)
+        y = np.rint(np.clip(y, info.min, info.max))
+    return y.astype(img.dtype)
 
-    if return_maps:
-        return y, np.squeeze(a_map), np.squeeze(b_map)
-    return y
-
-def salt_and_peper(img, p=0.005, q=0.005, s_min=0.0, s_max=1.0, seed=None):
+def salt_and_peper(img, p=0.005, q=0.005):
     """
     Applies salt-and-pepper (impulse) noise to an image array u(x):
         f(x) = s_min   with probability p
         f(x) = s_max   with probability q
         f(x) = u(x)    with probability 1 - p - q
 
+    s_min / s_max are taken from the dtype: integer images 0 / dtype max (uint8: 0 / 255),
+    float images 0 / 1.
+
     Parameters:
     -----------
-    u : ndarray
-        Input clean image array, expected to be in range [s_min, s_max] (default [0, 1]).
+    img : ndarray
+        Input clean image array u(x).
     p : float
         Probability of setting a pixel to s_min ("pepper" noise).
     q : float
         Probability of setting a pixel to s_max ("salt" noise).
-    s_min : float
-        Minimum intensity value (default 0.0).
-    s_max : float
-        Maximum intensity value (default 1.0).
-    seed : int, optional
-        Random seed for reproducibility.
 
     Returns:
     --------
     f : ndarray
-        The noisy image array with the same shape as u.
+        The noisy image array with the same shape and dtype as u.
     """
     if p < 0 or q < 0 or (p + q) > 1.0:
         raise ValueError("Probabilities must satisfy p >= 0, q >= 0, and p + q <= 1.")
 
-    rng = np.random.default_rng(seed)
-    
+    img = np.asarray(img)
+    if np.issubdtype(img.dtype, np.integer):
+        s_min, s_max = 0, np.iinfo(img.dtype).max
+    else:
+        s_min, s_max = 0.0, 1.0
+
     # Copy input image so original is not modified in place
     img_aug = np.array(img, copy=True)
     
     # Draw uniform random numbers in [0, 1) for every pixel
-    rand_map = rng.random(size=img.shape)
+    rand_map = np.random.random(size=img.shape)
     
     # Assign s_min with probability p
     img_aug[rand_map < p] = s_min
@@ -326,67 +174,11 @@ def salt_and_peper(img, p=0.005, q=0.005, s_min=0.0, s_max=1.0, seed=None):
     # Remaining pixels (rand_map >= p + q) keep u(x) with probability 1 - p - q
     return img_aug
 
-
-def motion_blur(img, tau_im=5.0, kernel_length=None, noise_std=0.0):
+def blurring_with_psf(img, sigma_0=2.0, rho=1.5, theta=0.0):
     """
-    Simulates motion blur and noise using the model:
-        g = h (x) f + n
-        h(x) = (1 / tau_im) * exp(-x / tau_im) for x >= 0, else 0
-
-    Parameters:
-    -----------
-    f : ndarray
-        Input clean image (2D grayscale or 3D RGB).
-    tau_im : float
-        Time constant / decay parameter for the exponential kernel.
-    kernel_length : int, optional
-        Length of the 1D motion kernel. If None, automatically 
-        set based on tau_im (e.g., 5 * tau_im).
-    noise_std : float
-        Standard deviation of the additive noise component n.
-
-    Returns:
-    --------
-    g : ndarray
-        The resulting blurred and noisy image.
-    """
-    if kernel_length is None:
-        kernel_length = max(int(np.ceil(5 * tau_im)), 3)
-        
-    # 1. Generate the 1D exponential kernel h(x) for x >= 0
-    x = np.arange(kernel_length, dtype=np.float32)
-    h = (1.0 / tau_im) * np.exp(-x / tau_im)
-    
-    # Normalize kernel so image brightness is preserved (energy conservation)
-    h /= np.sum(h)
-    
-    # Reshape into a 2D horizontal motion blur filter (1 x kernel_length)
-    h_2d = h.reshape(1, -1)
-    
-    # 2. Convolve image with kernel h (h \otimes f)
-    if img.ndim == 3:
-        # Handle multi-channel (RGB) images channel-by-channel
-        blurred = np.zeros_like(img, dtype=np.float32)
-        for c in range(img.shape[2]):
-            blurred[:, :, c] = convolve2d(img[:, :, c], h_2d, mode='same', boundary='symm')
-    else:
-        blurred = convolve2d(img, h_2d, mode='same', boundary='symm')
-        
-    # 3. Add noise component n
-    if noise_std > 0:
-        n = np.random.normal(loc=0.0, scale=noise_std, size=img.shape)
-        img_aug = blurred + n
-    else:
-        img_aug = blurred
-        
-    return img_aug
-
-
-def blurring_with_psf(img, sigma_0=2.0, rho=1.5, theta=0.0, noise_std=0.0):
-    """
-    Applies the parametric anisotropic blur and optional noise to a single-channel IR image.
+    Applies the parametric anisotropic blur to a single-channel IR image.
     For motion blur???: std: 0.3–3.0
-    
+
     Parameters:
     -----------
     img : ndarray (2D)
@@ -397,8 +189,6 @@ def blurring_with_psf(img, sigma_0=2.0, rho=1.5, theta=0.0, noise_std=0.0):
         Axis ratio (sigma_1 / sigma_0).
     theta : float
         Rotation angle in radians.
-    noise_std : float
-        Standard deviation for optional additive noise.
     """
     def generate_anisotropic_gaussian_kernel(sigma_0, rho=1.0, theta=0.0, k_size=None):
         """
@@ -456,54 +246,6 @@ def blurring_with_psf(img, sigma_0=2.0, rho=1.5, theta=0.0, noise_std=0.0):
     
     # 2. Convolve the single-channel IR image with the kernel (k \otimes f)
     img_aug = convolve2d(img, kernel, mode='same', boundary='symm')
-    
-    # 3. Add optional noise component
-    if noise_std > 0:
-        noise = np.random.normal(loc=0.0, scale=noise_std, size=img.shape)
-        img_aug += noise
-        
+
     return img_aug
 
-
-def stripe_noise(img, beta=0.1, rng=None):
-    """
-    Adds column-wise stripe noise to a single-channel IR image.
-
-    Model (Eqs. 1-3):
-        y_i = x_i + s_i          (i-th column)
-        s_i = (s_i, ..., s_i)    all n elements in a column are equal
-        s_i ~ N(0, sigma^2)      independent per column
-        sigma ~ U(0, beta)       drawn once per image
-
-    Parameters
-    ----------
-    img : ndarray (n, m)
-        Clean single-channel image X.
-    beta : float
-        Upper bound of the noise std; controls noise power.
-        Choose relative to the value range of img
-        (e.g. 0.05-0.2 for images in [0, 1], ~10-50 for 0..255).
-    rng : np.random.Generator or None
-        Optional generator for reproducibility.
-
-    Returns
-    -------
-    img_aug : ndarray (n, m)
-        Degraded image Y = X + S.
-    """
-    if rng is None:
-        rng = np.random.default_rng()
-
-    n, m = img.shape
-
-    # Eq. (3): one sigma per image
-    sigma = rng.uniform(0.0, beta)
-
-    # Eq. (2): one scalar per column, shape (1, m)
-    s = rng.normal(loc=0.0, scale=sigma, size=(1, m))
-
-    # Eq. (1): broadcast the same value down every row of a column
-    S = np.broadcast_to(s, (n, m))
-
-    img_aug = img.astype(np.float64) + S
-    return img_aug

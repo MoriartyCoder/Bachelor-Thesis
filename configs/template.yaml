@@ -90,9 +90,11 @@ train:
 # Entries run in the listed order. Switch each one with `enabled`.
 #   name:   any albumentations transform (https://albumentations.ai/docs/reference/supported-targets-by-transform/)
 #           or an IR sensor effect "ir.<effect>" from src/augmentations/ir_camara_effects.py:
-#             ir.netd, ir.fpn_corruption, ir.common_mode_noise, ir.histogram_shift,
-#             ir.histogram_compression, ir.fpn, ir.fpn2, ir.salt_and_pepper,
-#             ir.motion_blur, ir.psf_blur, ir.stripe_noise
+#             ir.netd, ir.fpn, ir.psf_blur, ir.histogram_shift, ir.histogram_compression,
+#             ir.salt_and_pepper
+#             - stripe noise = ir.fpn with mode: column (offsets per column only)
+#             - optical blur = ir.psf_blur with rho: 1 (isotropic),
+#               motion blur  = ir.psf_blur with rho < 1 (stretched along theta, radians)
 #           or ACB: copy-paste of training targets (Tong et al. 2024, src/augmentations/acb.py):
 #             crops a training target with context, augments the patch with RandAugment
 #             (num_ops ops from `ops`, magnitude 0..10) and blends it in at a random free spot
@@ -122,12 +124,11 @@ augmentation:
     - {name: GaussianBlur,   enabled: false, p: 0.3, params: {blur_limit: [3, 5]}}
     - {name: CLAHE,          enabled: false, p: 0.3, params: {clip_limit: 2.0, tile_grid_size: [8, 8]}}
     # --- IR sensor effects ---
-    - {name: ir.netd,                  enabled: false, p: 0.3, params: {min_sigma: 2.0, max_sigma: 16.0}}
-    - {name: ir.fpn,                   enabled: false, p: 0.3, params: {sigma_gain: 0.02, sigma_offset: 3.0, mode: column}}
-    - {name: ir.stripe_noise,          enabled: false, p: 0.3, params: {beta: 20.0}}
-    - {name: ir.common_mode_noise,     enabled: false, p: 0.3, params: {row_noise_level: 0.03, col_noise_level: 0.01}}
+    - {name: ir.netd,                  enabled: false, p: 0.3, params: {sigma: 0.0159}}   # sigma relative to [0,1]
+    - {name: ir.fpn,                   enabled: false, p: 0.3, params: {sigma_gain: 0.02, sigma_offset: 3.0, mode: pixel}}    # y = a*x + b + n; offsets/noise in grey values
+    - {name: ir.fpn,                   enabled: false, p: 0.3, params: {sigma_offset: 3.0, mode: column}}                     # stripe noise
     - {name: ir.histogram_shift,       enabled: false, p: 0.3, params: {delta_limit: 30}}
     - {name: ir.histogram_compression, enabled: false, p: 0.3, params: {gamma_min: 0.3, gamma_max: 0.9}}
     - {name: ir.salt_and_pepper,       enabled: false, p: 0.2, params: {p: 0.005, q: 0.005}}
-    - {name: ir.motion_blur,           enabled: false, p: 0.2, params: {tau_im: 3.0}}
-    - {name: ir.psf_blur,              enabled: false, p: 0.2, params: {sigma_0: 1.0, rho: 1.5}}
+    - {name: ir.psf_blur,              enabled: false, p: 0.2, params: {sigma_0: 1.2, rho: 1.0}}               # optical blur (isotropic)
+    - {name: ir.psf_blur,              enabled: false, p: 0.2, params: {sigma_0: 2.0, rho: 0.15, theta: 0.0}}  # motion blur (stretched)
