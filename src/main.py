@@ -1,6 +1,6 @@
 """Single entry point for every action. See `python src/main.py --help` and README.md.
 
-Order when several actions are given: prepare (-p) first, then train (-t).
+Order when several actions are given: prepare (-p), then build the target library (-l), then train (-t).
 """
 import logging
 import sys
@@ -27,6 +27,10 @@ def main(argv: list[str] | None = None) -> int:
             from data_handler.prepare_dataset import prepare_dataset
             for pid in args.prepare:
                 prepare_dataset(PREPARE_IDS[pid])
+
+        if args.build_library:
+            from augmentations.target_library import LibraryConfig, build_library
+            build_library(LibraryConfig(), overwrite=True)
 
         if args.train:
             from training.run import run  # heavy imports (torch/ultralytics) only when training

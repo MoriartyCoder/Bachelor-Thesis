@@ -94,18 +94,25 @@ def add_common_mode_noise(image, row_noise_level=0.03, col_noise_level=0.01):
     return np.clip(noisy_img, 0.0, 1.0)
 
 
+def intensity_shift(image, delta, g_max=255):
+    """
+    Globaler Intensitäts-Shift (deterministisch):
+    Y_tilde = Clip(Y + delta, 0, G_max)
+    Alle Grauwerte werden um denselben Betrag verschoben (globale Temperatur-Drift).
+    Werte, die über 0 / G_max hinausgehen, sättigen; dort geht Kontrast verloren.
+    """
+    shifted = image.astype(np.float32) + float(delta)
+    return np.clip(shifted, 0, g_max).astype(np.uint8)
+
+
 def thermal_histogram_shift(image, delta_limit=30):
     """
-    Greyvalue histogram shifting:
-    Y_tilde = Clip(Y + delta_g, 0, G_max)
+    Greyvalue histogram shifting (zufällig):
+    Y_tilde = Clip(Y + delta_g, 0, G_max),  delta_g ~ U(-delta_limit, +delta_limit)
     Moduliert tageszeitabhängige Temperaturvariationen und Solar-Drift.
     """
-    # delta_g gleichmäßig aus dem Bereich [-delta, +delta] sampeln
     delta_g = np.random.uniform(-delta_limit, delta_limit)
-    
-    # Verschiebung anwenden und auf [0, 255] clippen
-    shifted = image.astype(np.float32) + delta_g
-    return np.clip(shifted, 0, 255).astype(np.uint8)
+    return intensity_shift(image, delta_g)
 
 
 def thermal_histogram_compression(image, gamma_min=0.3, gamma_max=0.9):

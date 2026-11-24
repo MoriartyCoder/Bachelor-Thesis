@@ -12,6 +12,7 @@ NOTEBOOKS_DIR = ROOT_DIR / "notebooks"
 LOGS_DIR = ROOT_DIR / "logs"
 WEIGHTS_DIR = ROOT_DIR / "weights"
 CONFIGS_DIR = ROOT_DIR / "configs"
+LIBRARY_DIR = DATA_DIR / "library"  # PGDA target library (augmentations/target_library.py), not created on import
 
 
 ENSURE_DIRS_TO_EXIST = [DATA_DIR, OUTPUT_DIR]
