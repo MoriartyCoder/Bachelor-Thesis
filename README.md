@@ -64,6 +64,8 @@ and `test_metrics.json`.
 
 Augmentations are listed in `augmentation.pipeline` of the config. Each one is an Albumentations
 transform name, an IR effect `ir.<name>` or `ACB`, and each can be switched on or off with `enabled`.
+All augmentations work on grayscale uint8 HxW frames (also when called directly in a notebook,
+e.g. on a `cv2.imread(path, cv2.IMREAD_GRAYSCALE)` frame) and return uint8; the model gets 1 channel.
 `ACB` (`src/augmentations/acb.py`, Tong et al. 2024) pastes augmented copies of training targets
 with their own boxes; its parameters are explained in `configs/template.yaml`. The dry-run
 previews show the pasted targets and their boxes.

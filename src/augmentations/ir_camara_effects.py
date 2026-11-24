@@ -1,7 +1,9 @@
-import cv2, os, torch
+"""IR sensor effects. Every function takes a grayscale uint8 HxW frame and returns one
+(see augmentations/uint8.py). They draw from the global NumPy RNG."""
+import cv2
 import numpy as np
-from scipy.signal import convolve2d
 
+from augmentations.uint8 import RAMP, check_gray_uint8, to_uint8
 
 
 def netd_noise(image, sigma=0.0):
@@ -10,21 +12,14 @@ def netd_noise(image, sigma=0.0):
         T_noise(x, y) = T_ref(x, y) + eta(x, y),   eta ~ N(0, sigma_T^2)
     eta wird für jedes Pixel und bei jedem Aufruf (= jedem Frame) neu gezogen, Mittelwert 0.
 
-    sigma: Standardabweichung relativ zum vollen Wertebereich [0, 1] (bei 8 bit: sigma * 255 Grauwerte).
+    sigma: Standardabweichung relativ zum vollen Wertebereich [0, 1] (also sigma * 255 Grauwerte).
            Größeres sigma = weniger empfindliche (z.B. günstige) Kamera.
-    image: Ganzzahl-Bild (z.B. uint8, Wertebereich 0..dtype-Max) oder Float-Bild in [0, 1].
-           Rückgabe im selben dtype, auf den Wertebereich geclippt.
     """
-    image = np.asarray(image)
-    integer = np.issubdtype(image.dtype, np.integer)
-    scale = float(np.iinfo(image.dtype).max) if integer else 1.0
-
-    eta = np.random.normal(0.0, sigma * scale, image.shape)
-    noisy = np.clip(image.astype(np.float32) + eta, 0.0, scale)
-
-    if integer:
-        noisy = np.rint(noisy)
-    return noisy.astype(image.dtype)
+    check_gray_uint8(image)
+    if sigma <= 0:
+        return image.copy()
+    eta = np.random.normal(0.0, sigma * 255.0, image.shape)
+    return to_uint8(image + eta)
 
 def intensity_shift(image, delta):
     """
@@ -33,8 +28,8 @@ def intensity_shift(image, delta):
     Alle Grauwerte werden um denselben Betrag verschoben (globale Temperatur-Drift).
     Werte, die über 0 / 255 hinausgehen, sättigen; dort geht Kontrast verloren.
     """
-    shifted = image.astype(np.float32) + float(delta)
-    return np.clip(shifted, 0, 255).astype(np.uint8)
+    check_gray_uint8(image)
+    return cv2.LUT(image, to_uint8(RAMP + float(delta)))
 
 def thermal_histogram_shift(image, delta_limit=30):
     """
@@ -51,17 +46,15 @@ def thermal_histogram_compression(image, gamma_min=0.3, gamma_max=0.9):
     Y_tilde = Y_mid + gamma * (Y - Y_mid)
     Simuliert Thermal Crossover / niedrigen Signal-to-Clutter Ratio (SCR < 2.0).
     """
+    check_gray_uint8(image)
     # Faktor gamma aus (0, 1] sampeln (z.B. 0.3 bis 0.9 für starke Kompression)
     gamma = np.random.uniform(gamma_min, gamma_max)
-    
-    # Median-Intensität Y_mid des Bildes berechnen
-    y_mid = np.median(image)
-    
-    # Kompression um Y_mid durchführen
-    compressed = y_mid + gamma * (image.astype(np.float32) - y_mid)
-    
-    # Clippen und zurück zu uint8
-    return np.clip(compressed, 0, 255).astype(np.uint8)
+
+    # Median-Intensität Y_mid des Bildes
+    y_mid = float(np.median(image))
+
+    # Kompression um Y_mid als Lookup-Tabelle (das Bild selbst bleibt uint8)
+    return cv2.LUT(image, to_uint8(y_mid + gamma * (RAMP - y_mid)))
 
 
 ######################################################################################
@@ -73,7 +66,7 @@ def thermal_histogram_compression(image, gamma_min=0.3, gamma_max=0.9):
 
 def fpn(img,
             sigma_gain=0.0,       # std of PRNU a(i,j) around 1 (unitless, e.g. 0.01-0.05)
-            sigma_offset=0.0,     # std of DSNU b(i,j) around 0 (in intensity units, e.g. 1-5 on 0-255)
+            sigma_offset=0.0,     # std of DSNU b(i,j) around 0 (in grey values, e.g. 1-5)
             mode="pixel"):        # "pixel", "column" or "row"
     """
     Fixed pattern noise model:  y = a * x + b
@@ -91,86 +84,58 @@ def fpn(img,
                     i.e. only an additive offset per column.
         "row"    -> one a, b per row (horizontal stripes)
 
-    Integer images are clipped to the range of their dtype; float images are not clipped.
-    For multi-channel images the same (a, b) pattern is applied to every channel.
+    The result is rounded and clipped to [0, 255].
     """
-    img = np.asarray(img)
-    H, W = img.shape[:2]
+    check_gray_uint8(img)
+    H, W = img.shape
+    shapes = {"pixel": (H, W), "column": (1, W), "row": (H, 1)}
+    if mode not in shapes:
+        raise ValueError("mode must be 'pixel', 'column' or 'row'")
+    if sigma_gain <= 0 and sigma_offset <= 0:
+        return img.copy()
 
-    def draw(mean, sigma):
-        if mode == "pixel":
-            shape = (H, W)
-        elif mode == "column":
-            shape = (1, W)
-        elif mode == "row":
-            shape = (H, 1)
-        else:
-            raise ValueError("mode must be 'pixel', 'column' or 'row'")
-        m = np.full(shape, mean, dtype=np.float32)
-        if sigma > 0:
-            m += np.random.normal(0.0, sigma, size=shape).astype(np.float32)
-        return np.broadcast_to(m, (H, W)).copy()
-
-    a_map = draw(1.0, sigma_gain)
-    b_map = draw(0.0, sigma_offset)
-
-    x = img.astype(np.float32)
-    if x.ndim == 3:
-        a_map = a_map[..., None]
-        b_map = b_map[..., None]
-
-    y = a_map * x + b_map
-
-    if np.issubdtype(img.dtype, np.integer):
-        info = np.iinfo(img.dtype)
-        y = np.rint(np.clip(y, info.min, info.max))
-    return y.astype(img.dtype)
+    # (1, W) / (H, 1) maps broadcast over the image: stripes
+    a = 1.0 + np.random.normal(0.0, sigma_gain, shapes[mode]) if sigma_gain > 0 else 1.0
+    b = np.random.normal(0.0, sigma_offset, shapes[mode]) if sigma_offset > 0 else 0.0
+    return to_uint8(a * img + b)
 
 def salt_and_peper(img, p=0.005, q=0.005):
     """
     Applies salt-and-pepper (impulse) noise to an image array u(x):
-        f(x) = s_min   with probability p
-        f(x) = s_max   with probability q
-        f(x) = u(x)    with probability 1 - p - q
-
-    s_min / s_max are taken from the dtype: integer images 0 / dtype max (uint8: 0 / 255),
-    float images 0 / 1.
+        f(x) = 0     with probability p
+        f(x) = 255   with probability q
+        f(x) = u(x)  with probability 1 - p - q
 
     Parameters:
     -----------
     img : ndarray
-        Input clean image array u(x).
+        Input clean image u(x), uint8 HxW.
     p : float
-        Probability of setting a pixel to s_min ("pepper" noise).
+        Probability of setting a pixel to 0 ("pepper" noise).
     q : float
-        Probability of setting a pixel to s_max ("salt" noise).
+        Probability of setting a pixel to 255 ("salt" noise).
 
     Returns:
     --------
     f : ndarray
-        The noisy image array with the same shape and dtype as u.
+        The noisy image, uint8 HxW.
     """
+    check_gray_uint8(img)
     if p < 0 or q < 0 or (p + q) > 1.0:
         raise ValueError("Probabilities must satisfy p >= 0, q >= 0, and p + q <= 1.")
 
-    img = np.asarray(img)
-    if np.issubdtype(img.dtype, np.integer):
-        s_min, s_max = 0, np.iinfo(img.dtype).max
-    else:
-        s_min, s_max = 0.0, 1.0
-
     # Copy input image so original is not modified in place
-    img_aug = np.array(img, copy=True)
-    
+    img_aug = img.copy()
+
     # Draw uniform random numbers in [0, 1) for every pixel
     rand_map = np.random.random(size=img.shape)
-    
-    # Assign s_min with probability p
-    img_aug[rand_map < p] = s_min
-    
-    # Assign s_max with probability q
-    img_aug[(rand_map >= p) & (rand_map < (p + q))] = s_max
-    
+
+    # Assign 0 with probability p
+    img_aug[rand_map < p] = 0
+
+    # Assign 255 with probability q
+    img_aug[(rand_map >= p) & (rand_map < (p + q))] = 255
+
     # Remaining pixels (rand_map >= p + q) keep u(x) with probability 1 - p - q
     return img_aug
 
@@ -181,8 +146,8 @@ def blurring_with_psf(img, sigma_0=2.0, rho=1.5, theta=0.0):
 
     Parameters:
     -----------
-    img : ndarray (2D)
-        Single-channel clean IR image.
+    img : ndarray
+        Clean IR image, uint8 HxW.
     sigma_0 : float
         Standard deviation of the main axis.
     rho : float
@@ -194,7 +159,7 @@ def blurring_with_psf(img, sigma_0=2.0, rho=1.5, theta=0.0):
         """
         Generates an anisotropic Gaussian blur kernel:
             k(x, y) = Z * exp(-(a0*x^2 + 2*a1*x*y + a2*y^2))
-            
+
         Parameters:
         -----------
         sigma_0 : float
@@ -204,12 +169,12 @@ def blurring_with_psf(img, sigma_0=2.0, rho=1.5, theta=0.0):
         theta : float
             Angle between the major axis and the horizontal (in radians).
         k_size : int, optional
-            Size of the square kernel grid. If None, it is automatically 
+            Size of the square kernel grid. If None, it is automatically
             calculated based on sigma_0 and rho.
         """
         if sigma_0 <= 0:
             raise ValueError("sigma_0 must be strictly positive.")
-            
+
         # Automatically determine grid size based on the maximum spread
         sigma_max = sigma_0 * max(1.0, rho)
         if k_size is None:
@@ -220,32 +185,33 @@ def blurring_with_psf(img, sigma_0=2.0, rho=1.5, theta=0.0):
 
         # Create coordinate grid centered at (0, 0)
         y, x = np.mgrid[-radius:radius+1, -radius:radius+1]
-        
+
         # Precompute trigonometric terms and common factors
         cos_t = np.cos(theta)
         sin_t = np.sin(theta)
         rho_sq = rho ** 2
         two_sigma0_sq = 2.0 * (sigma_0 ** 2)
-        
+
         # Compute coefficients a0, a1, a2 as defined in the model
         a0 = (cos_t ** 2) / two_sigma0_sq + (sin_t ** 2) / (2.0 * rho_sq * (sigma_0 ** 2))
         a1 = (np.sin(2.0 * theta) / (4.0 * (sigma_0 ** 2))) * ((1.0 / rho_sq) - 1.0)
         a2 = (sin_t ** 2) / two_sigma0_sq + (cos_t ** 2) / (2.0 * rho_sq * (sigma_0 ** 2))
-        
+
         # Evaluate the Gaussian exponent
         exponent = -(a0 * (x ** 2) + 2.0 * a1 * x * y + a2 * (y ** 2))
         kernel = np.exp(exponent)
-        
+
         # Normalization constant Z so the area (sum) of the kernel is 1
         kernel /= np.sum(kernel)
-        
+
         return kernel
+
+    check_gray_uint8(img)
 
     # 1. Generate the anisotropic blur kernel k(x, y)
     kernel = generate_anisotropic_gaussian_kernel(sigma_0, rho, theta)
-    
-    # 2. Convolve the single-channel IR image with the kernel (k \otimes f)
-    img_aug = convolve2d(img, kernel, mode='same', boundary='symm')
 
-    return img_aug
-
+    # 2. Convolve the IR image with the kernel (k \otimes f), directly on uint8.
+    #    filter2D computes a correlation; the kernel is point-symmetric (k(x,y) = k(-x,-y)),
+    #    so this equals the convolution. BORDER_REFLECT = scipy's boundary='symm'.
+    return cv2.filter2D(img, -1, kernel, borderType=cv2.BORDER_REFLECT)

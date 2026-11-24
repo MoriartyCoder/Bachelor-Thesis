@@ -30,8 +30,8 @@ class AlbuStep:
             # own RNG per DataLoader worker (same approach as ultralytics' Albumentations wrapper)
             self.transform.set_random_seed(torch.initial_seed())
 
-        img = labels["img"]
-        h, w = img.shape[:2]
+        img = labels["img"][..., 0]  # Ultralytics loads grayscale as HxWx1; the pipeline works on HxW (view)
+        h, w = img.shape
         instances = labels["instances"]
         instances.convert_bbox("xywh")
         instances.normalize(w, h)
@@ -40,7 +40,7 @@ class AlbuStep:
 
         new = self.transform(image=img, bboxes=bboxes, class_labels=cls)
 
-        labels["img"] = np.ascontiguousarray(new["image"])
+        labels["img"] = np.ascontiguousarray(new["image"])[..., None]
         labels["cls"] = np.asarray(new["class_labels"], dtype=np.float32).reshape(-1, 1)
         instances.update(np.asarray(new["bboxes"], dtype=np.float32).reshape(-1, 4))
         labels["instances"] = instances

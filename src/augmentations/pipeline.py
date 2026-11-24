@@ -6,17 +6,15 @@ Entry names:
   * anything else  -> ``albumentations.<name>`` (e.g. HorizontalFlip, GaussNoise, ...)
 
 Each entry: ``{name, enabled, p, params}``. Disabled entries are skipped.
-The pipeline works on uint8 HxWx3 images (the IR frames are stored as 3 identical
-channels) and on YOLO-normalized boxes.
+The pipeline works on grayscale uint8 HxW images (see augmentations/uint8.py) and on
+YOLO-normalized boxes.
 """
 from __future__ import annotations
 
 import warnings
-from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Callable
 
 import albumentations as A
-import cv2
 import numpy as np
 
 from augmentations import ir_camara_effects as ir
@@ -26,30 +24,19 @@ from log_setup import get_logger
 logger = get_logger(__name__)
 
 
-@dataclass(frozen=True)
-class IREffect:
-    fn: Callable[..., Any]
-    unit_range: bool = False  # True: fn expects/returns [0, 1] instead of [0, 255]
-
-
-# Name used in the config (after "ir.") -> implementation.
-IR_EFFECTS: dict[str, IREffect] = {
-    "netd": IREffect(ir.netd_noise),
-    "histogram_shift": IREffect(ir.thermal_histogram_shift),
-    "histogram_compression": IREffect(ir.thermal_histogram_compression),
-    "fpn": IREffect(ir.fpn),
-    "salt_and_pepper": IREffect(ir.salt_and_peper),
-    "psf_blur": IREffect(ir.blurring_with_psf),
+# Name used in the config (after "ir.") -> implementation (uint8 HxW in, uint8 HxW out).
+IR_EFFECTS: dict[str, Callable[..., np.ndarray]] = {
+    "netd": ir.netd_noise,
+    "histogram_shift": ir.thermal_histogram_shift,
+    "histogram_compression": ir.thermal_histogram_compression,
+    "fpn": ir.fpn,
+    "salt_and_pepper": ir.salt_and_peper,
+    "psf_blur": ir.blurring_with_psf,
 }
 
 
 class IRTransform(A.ImageOnlyTransform):
-    """Wraps one IR effect as a pixel-only Albumentations transform.
-
-    Normalizes the different conventions of the raw functions: runs them on a single
-    grayscale channel, converts to [0, 1] when needed, takes the image out of tuple
-    returns, and converts back to clipped uint8 with the input's channel count.
-    """
+    """Wraps one IR effect as a pixel-only Albumentations transform."""
 
     def __init__(self, effect: str, fn_kwargs: dict | None = None, p: float = 0.5):
         super().__init__(p=p)
@@ -59,22 +46,7 @@ class IRTransform(A.ImageOnlyTransform):
         self.fn_kwargs = dict(fn_kwargs or {})
 
     def apply(self, img: np.ndarray, **_) -> np.ndarray:
-        spec = IR_EFFECTS[self.effect]
-        channels = 1 if img.ndim == 2 else img.shape[2]
-        gray = img if img.ndim == 2 else (img[..., 0] if channels == 1 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
-
-        x = gray.astype(np.float32) / 255.0 if spec.unit_range else gray
-        out = spec.fn(x, **self.fn_kwargs)
-        if isinstance(out, tuple):
-            out = out[0]
-        out = np.asarray(out, dtype=np.float32)
-        if spec.unit_range:
-            out = out * 255.0
-        out = np.clip(np.rint(out), 0, 255).astype(np.uint8)
-
-        if img.ndim == 2:
-            return out
-        return np.repeat(out[..., None], channels, axis=2)
+        return IR_EFFECTS[self.effect](img, **self.fn_kwargs)
 
     def get_transform_init_args_names(self):
         return ("effect", "fn_kwargs")

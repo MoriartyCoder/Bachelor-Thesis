@@ -279,16 +279,20 @@ def local_contrast(img: np.ndarray, bbox, d: int = 20, gap: int = 2, sigma_floor
     b = _box_int(bbox, W, H)
     if b is None:
         return None
+    
     x0, y0, x1, y1 = b
     wx0, wy0, wx1, wy1 = max(x0 - d, 0), max(y0 - d, 0), min(x1 + d, W), min(y1 + d, H)
     win = img[wy0:wy1, wx0:wx1].astype(np.float32)
     ring = np.ones(win.shape, bool)
     ring[max(y0 - gap, 0) - wy0:min(y1 + gap, H) - wy0, max(x0 - gap, 0) - wx0:min(x1 + gap, W) - wx0] = False
+
     if hud_rows > wy0:
         ring[:hud_rows - wy0, :] = False
+
     bg = win[ring]
     if bg.size < 30:
         return None
+    
     mu_b, sigma_b = float(bg.mean()), max(float(bg.std()), sigma_floor)
     box = img[y0:y1, x0:x1].astype(np.float32)
     sp, st = (float(box.max()) - mu_b) / sigma_b, (mu_b - float(box.min())) / sigma_b
@@ -326,9 +330,7 @@ class TargetCut:
 
 
 def segment_target(img: np.ndarray, bbox, cfg: LibraryConfig) -> TargetCut:
-    """Pseudo mask of the target in `bbox` (x, y, w, h) of the grayscale uint8 frame `img`."""
-    if img.ndim == 3:
-        img = img[..., 0]  # IR frames: 3 identical channels
+    """Pseudo mask of the target in `bbox` (x, y, w, h) of the grayscale uint8 HxW frame `img`."""
     H, W = img.shape
     b = _box_int(bbox, W, H)
     if b is None:

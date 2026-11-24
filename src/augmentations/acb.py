@@ -51,8 +51,10 @@ Ablations (paper's Tables V/VI):
   defaults                      -> full ACB (box, random augment, adaptive fusion)
   ``fusion: none`` / ``num_ops: 0`` alone -> one component switched off (not in the paper)
 
-Works on uint8 HxW or HxWxC images whose channels are identical (our IR frames) and on
-any Albumentations bbox format; the new boxes get ``class_label`` in every label field.
+Works on grayscale uint8 HxW images (see augmentations/uint8.py) and on any Albumentations
+bbox format; the new boxes get ``class_label`` in every label field. Point operations run
+as lookup tables and filters in OpenCV on uint8; only the fusion (Eq. 7) computes in float
+once. Results are rounded (PIL/torchvision truncate, which darkens by ~0.5 grey values).
 """
 from __future__ import annotations
 
@@ -65,6 +67,7 @@ import cv2
 import numpy as np
 from albumentations.core.type_definitions import Targets
 
+from augmentations.uint8 import RAMP, check_gray_uint8, to_uint8
 from data_handler.formats import FrameRecord
 from log_setup import get_logger
 
@@ -171,30 +174,34 @@ def _scale(p: Patch, m: float, rng: np.random.Generator) -> Patch:
     return Patch(img, valid, (cx * sx, cy * sy, bw * sx, bh * sy))
 
 
-def _blend(p: Patch, degenerate: np.ndarray | float, factor: float) -> Patch:
-    """PIL ImageEnhance / torchvision _blend: factor * img + (1 - factor) * degenerate."""
-    out = factor * p.img.astype(np.float32) + (1.0 - factor) * degenerate
-    img = np.clip(np.rint(out), 0, 255).astype(np.uint8)
+def _point_op(p: Patch, lut: np.ndarray) -> Patch:
+    """y = f(x) as a lookup table over the 256 grey values (`lut` = f(RAMP), any float)."""
+    img = cv2.LUT(p.img, to_uint8(lut))
     img[~p.valid] = 0
     return Patch(img, p.valid, p.box)
 
 
+# PIL ImageEnhance / torchvision _blend: factor * img + (1 - factor) * degenerate
 def _brightness(p: Patch, m: float, rng: np.random.Generator) -> Patch:
-    return _blend(p, 0.0, max(0.0, 1.0 + 0.9 * m))
+    return _point_op(p, max(0.0, 1.0 + 0.9 * m) * RAMP)  # degenerate = 0
 
 
 def _contrast(p: Patch, m: float, rng: np.random.Generator) -> Patch:
-    return _blend(p, float(p.img[p.valid].mean()), max(0.0, 1.0 + 0.9 * m))
+    factor = max(0.0, 1.0 + 0.9 * m)
+    mean = float(p.img[p.valid].mean())  # degenerate = mean grey value
+    return _point_op(p, factor * RAMP + (1.0 - factor) * mean)
 
 
 def _sharpness(p: Patch, m: float, rng: np.random.Generator) -> Patch:
     if min(p.img.shape) <= 2:
         return p
+    factor = max(0.0, 1.0 + 0.9 * m)
     kernel = np.array([[1, 1, 1], [1, 5, 1], [1, 1, 1]], dtype=np.float32) / 13.0
-    img = p.img.astype(np.float32)
-    degenerate = img.copy()  # border pixels stay unchanged, as in PIL/torchvision
-    degenerate[1:-1, 1:-1] = cv2.filter2D(img, -1, kernel)[1:-1, 1:-1]
-    return _blend(p, degenerate, max(0.0, 1.0 + 0.9 * m))
+    degenerate = p.img.copy()  # border pixels stay unchanged, as in PIL/torchvision
+    degenerate[1:-1, 1:-1] = cv2.filter2D(p.img, -1, kernel)[1:-1, 1:-1]  # uint8, like PIL's SMOOTH image
+    img = cv2.addWeighted(p.img, factor, degenerate, 1.0 - factor, 0.0)  # rounded + saturated to uint8
+    img[~p.valid] = 0
+    return Patch(img, p.valid, p.box)
 
 
 def _identity(p: Patch, m: float, rng: np.random.Generator) -> Patch:
@@ -208,7 +215,7 @@ def _posterize(p: Patch, m: float, rng: np.random.Generator) -> Patch:
 
 def _solarize(p: Patch, m: float, rng: np.random.Generator) -> Patch:
     threshold = max(0.0, 255.0 * (1.0 - m))
-    img = np.where(p.img >= threshold, 255 - p.img, p.img).astype(np.uint8)
+    img = np.where(p.img >= threshold, 255 - p.img, p.img)
     img[~p.valid] = 0
     return Patch(img, p.valid, p.box)
 
@@ -218,9 +225,7 @@ def _autocontrast(p: Patch, m: float, rng: np.random.Generator) -> Patch:
     lo, hi = float(vals.min()), float(vals.max())
     if hi <= lo:
         return p
-    img = np.clip((p.img.astype(np.float32) - lo) * (255.0 / (hi - lo)), 0, 255).astype(np.uint8)
-    img[~p.valid] = 0
-    return Patch(img, p.valid, p.box)
+    return _point_op(p, (RAMP - lo) * (255.0 / (hi - lo)))
 
 
 def _equalize(p: Patch, m: float, rng: np.random.Generator) -> Patch:
@@ -282,12 +287,8 @@ def paste_weights(p: Patch, fusion: str) -> np.ndarray | None:
 
 
 def fuse(region: np.ndarray, patch: np.ndarray, weights: np.ndarray) -> np.ndarray:
-    """Eq. (7): I' = T' * T + (1 - T') * I, on every channel of `region` (uint8)."""
-    t, w = patch.astype(np.float32), weights
-    if region.ndim == 3:
-        t, w = t[..., None], w[..., None]
-    out = w * t + (1.0 - w) * region.astype(np.float32)
-    return np.clip(np.rint(out), 0, 255).astype(np.uint8)
+    """Eq. (7): I' = T' * T + (1 - T') * I. uint8 region and patch, float32 weights -> uint8."""
+    return to_uint8(weights * patch + (1.0 - weights) * region)
 
 
 def _overlaps(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> bool:
@@ -431,8 +432,7 @@ class ACB(A.DualTransform):
         }
 
     def apply(self, img: np.ndarray, pastes: list, **params: Any) -> np.ndarray:
-        if img.dtype != np.uint8:
-            raise TypeError(f"ACB expects uint8 images, got {img.dtype}")
+        check_gray_uint8(img)
         if not pastes:
             return img
         out = img.copy()

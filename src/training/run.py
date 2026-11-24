@@ -143,7 +143,7 @@ def write_snapshots(run_dir: Path, cfg_path: Path, cfg: dict, overrides: dict, d
 
 
 def write_data_yaml(run_dir: Path, manifest_txts: dict[str, Path]) -> Path:
-    data = {"path": str(run_dir), "names": CLASS_NAMES, "channels": 3}
+    data = {"path": str(run_dir), "names": CLASS_NAMES, "channels": 1}  # grayscale IR: 1-channel model input
     data.update({split: str(p) for split, p in manifest_txts.items()})
     path = run_dir / "data.yaml"
     path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
@@ -161,12 +161,12 @@ def save_previews(records, albu, cfg_overrides: dict, out_dir: Path, n: int = 16
     without = [r for r in records if r.bbox is None][: n - len(with_box)]
     subset = with_box + without
     ucfg = get_cfg(overrides={k: v for k, v in cfg_overrides.items() if k not in ("model", "data")})
-    ds = build_record_dataset(ucfg, subset, albu, batch=len(subset), data={"names": CLASS_NAMES, "nc": 1, "channels": 3},
+    ds = build_record_dataset(ucfg, subset, albu, batch=len(subset), data={"names": CLASS_NAMES, "nc": 1, "channels": 1},
                               mode="train")
     logger.debug(f"Previews: {len(with_box)} frames with target, {len(without)} without")
     for i in range(len(ds)):
         item = ds[i]
-        img = item["img"].numpy().transpose(1, 2, 0)[..., ::-1].copy()  # CHW RGB -> HWC BGR
+        img = cv2.cvtColor(item["img"].numpy()[0], cv2.COLOR_GRAY2BGR)  # 1xHxW -> colour, only to draw the red box
         h, w = img.shape[:2]
         for cx, cy, bw, bh in item["bboxes"].numpy():
             x0, y0 = int((cx - bw / 2) * w), int((cy - bh / 2) * h)

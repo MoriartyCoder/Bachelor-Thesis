@@ -40,8 +40,10 @@ def load_dataset_split(dataset: DatasetName, split: str, root: Path | None = Non
     if not split_dir.is_dir():
         logger.warning(f"[{split}] {dataset}: {split_dir} not found, skipped.{_missing_hint(dataset)}")
         return []
+    
     if fmt not in FORMAT_LOADERS:
         raise KeyError(f"Dataset {dataset}: unknown format '{fmt}'. Available: {sorted(FORMAT_LOADERS)}")
+    
     start = time.perf_counter()
     recs = FORMAT_LOADERS[fmt](split_dir, dataset)
     logger.info(f"[{split}] {dataset}: {len(recs)} frames in {len({r.seq for r in recs})} sequences "
@@ -65,6 +67,7 @@ def collect_split(cfg: dict, split: str) -> list[FrameRecord]:
     records = load_split(cfg, split)
     if not records:
         raise NoDataError(f"No frames for split '{split}': all datasets are disabled, missing or empty.")
+    
     seed = cfg["run"]["seed"] + SPLITS.index(split)  # independent but reproducible per split
     sampled = apply_sampler(records, cfg["sampling"][split], seed)
     if not sampled:
