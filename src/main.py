@@ -29,7 +29,7 @@ def main(argv: list[str] | None = None) -> int:
                 prepare_dataset(PREPARE_IDS[pid])
 
         if args.build_library:
-            from augmentations.target_library import LibraryConfig, build_library
+            from data_handler.target_library import LibraryConfig, build_library
             build_library(LibraryConfig(), overwrite=True)
 
         if args.train:

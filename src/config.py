@@ -12,7 +12,7 @@ NOTEBOOKS_DIR = ROOT_DIR / "notebooks"
 LOGS_DIR = ROOT_DIR / "logs"
 WEIGHTS_DIR = ROOT_DIR / "weights"
 CONFIGS_DIR = ROOT_DIR / "configs"
-LIBRARY_DIR = DATA_DIR / "library"  # PGDA target library (augmentations/target_library.py), not created on import
+LIBRARY_DIR = DATA_DIR / "library"  # PGDA target library (data_handler/target_library.py), not created on import
 
 
 ENSURE_DIRS_TO_EXIST = [DATA_DIR, OUTPUT_DIR]
@@ -64,7 +64,7 @@ SCHEDULER_REGISTRY = []
 
 # Every Ultralytics-internal augmentation, forced off. Merged LAST into the
 # trainer overrides so no config can switch one on. Albumentations (see
-# augmentations/pipeline.py) is the only augmentation source.
+# data_handler/augmentation.py) is the only augmentation source.
 ULTRALYTICS_AUG_OFF: dict[str, Any] = {
     "hsv_h": 0.0, "hsv_s": 0.0, "hsv_v": 0.0,
     "degrees": 0.0, "translate": 0.0, "scale": 0.0, "shear": 0.0, "perspective": 0.0,
@@ -79,6 +79,10 @@ _MANAGED_TRAIN_KEYS = {
 }
 
 _TOP_LEVEL_KEYS = {"run", "datasets", "sampling", "model", "train", "augmentation"}
+
+# Sections of `augmentation:` (registries in src/augmentations/<section>.py). Default order of
+# `augmentation.order`: copy-paste builds the scene first, the IR camera effects come last.
+AUG_SECTION_ORDER = ("sota", "default", "edge_cases", "ir")
 SPLITS = ("train", "val", "test")
 
 
@@ -152,17 +156,64 @@ def load_run_config(path: str | Path) -> dict[str, Any]:
         )
     train.setdefault("device", "auto")
 
-    aug = cfg.setdefault("augmentation", {})
-    aug.setdefault("bbox", {})
-    aug.setdefault("pipeline", [])
-    for entry in aug["pipeline"]:
-        if "name" not in entry:
-            raise ConfigError(f"Augmentation entry {entry} is missing `name`.")
-        entry.setdefault("enabled", True)
-        entry.setdefault("p", 1.0)
-        entry.setdefault("params", {})
-
+    cfg["augmentation"] = cfg.get("augmentation") or {}
+    _validate_augmentation(cfg["augmentation"])
     return cfg
+
+
+def _validate_entry(entry: Any, where: str) -> None:
+    if not isinstance(entry, dict) or "name" not in entry:
+        raise ConfigError(f"Augmentation entry {entry} in {where} is missing `name`.")
+    entry.setdefault("enabled", True)
+    entry.setdefault("p", 1.0)
+    entry.setdefault("params", {})
+
+
+def _validate_augmentation(aug: dict) -> None:
+    """Sections, order, one_of groups and entries of the `augmentation:` section (in place, with defaults)."""
+    if "pipeline" in aug:
+        raise ConfigError(
+            "`augmentation.pipeline` is the old flat layout. Put the entries into the sections "
+            f"{list(AUG_SECTION_ORDER)} (`augmentation.<section>.pipeline`), see configs/template.yaml."
+        )
+    unknown = set(aug) - {"bbox", "order", *AUG_SECTION_ORDER}
+    if unknown:
+        raise ConfigError(f"Unknown keys {sorted(unknown)} in `augmentation`. "
+                          f"Allowed: bbox, order, {', '.join(AUG_SECTION_ORDER)}")
+    aug.setdefault("bbox", {})
+    order = aug.setdefault("order", list(AUG_SECTION_ORDER))
+    if sorted(order) != sorted(AUG_SECTION_ORDER):
+        raise ConfigError(f"`augmentation.order` must list each section exactly once: {list(AUG_SECTION_ORDER)} "
+                          f"in any order, got {order}")
+
+    for section in AUG_SECTION_ORDER:
+        sec = aug.get(section) or {}
+        aug[section] = sec
+        unknown = set(sec) - {"enabled", "pipeline"}
+        if unknown:
+            raise ConfigError(f"Unknown keys {sorted(unknown)} in `augmentation.{section}` (allowed: enabled, pipeline).")
+        sec.setdefault("enabled", True)
+        sec["pipeline"] = sec.get("pipeline") or []
+        for item in sec["pipeline"]:
+            if isinstance(item, dict) and "one_of" in item:
+                group = item["one_of"] or {}
+                item["one_of"] = group
+                where = f"augmentation.{section}.one_of"
+                if set(item) != {"one_of"}:
+                    raise ConfigError(f"A one_of item in augmentation.{section} must only contain `one_of:` "
+                                      f"(put enabled/p/pipeline inside it), got keys {sorted(item)}.")
+                unknown = set(group) - {"enabled", "p", "pipeline"}
+                if unknown:
+                    raise ConfigError(f"Unknown keys {sorted(unknown)} in {where} (allowed: enabled, p, pipeline).")
+                group.setdefault("enabled", True)
+                group.setdefault("p", 1.0)
+                group["pipeline"] = group.get("pipeline") or []
+                for member in group["pipeline"]:
+                    if isinstance(member, dict) and "one_of" in member:
+                        raise ConfigError(f"{where}: one_of groups cannot be nested.")
+                    _validate_entry(member, where)
+            else:
+                _validate_entry(item, f"augmentation.{section}")
 
 
 TEMPLATE_CONFIG = {

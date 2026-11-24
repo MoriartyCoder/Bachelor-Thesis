@@ -31,7 +31,7 @@ class AntiUAVDataset(Dataset):
         self.split = split
         self.debug = debug
         self.samples = [r for ds in self.datasets for r in load_dataset_split(ds, split)]
-        self.transform = transform if transform is not None else ir_augmentation_pipeline
+        self.transform = transform
         if debug:
             self.reverse_path = {r.img_path: i for i, r in enumerate(self.samples)}
 

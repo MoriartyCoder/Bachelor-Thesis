@@ -87,48 +87,109 @@ train:
 
 # -----------------------------------------------------------------------------
 # Augmentation (Albumentations, applied to the training split only).
-# Entries run in the listed order. Switch each one with `enabled`.
-#   name:   any albumentations transform (https://albumentations.ai/docs/reference/supported-targets-by-transform/)
-#           or an IR sensor effect "ir.<effect>" from src/augmentations/ir_camara_effects.py:
-#             ir.netd, ir.fpn, ir.psf_blur, ir.histogram_shift, ir.histogram_compression,
-#             ir.salt_and_pepper
-#             - stripe noise = ir.fpn with mode: column (offsets per column only)
-#             - optical blur = ir.psf_blur with rho: 1 (isotropic),
-#               motion blur  = ir.psf_blur with rho < 1 (stretched along theta, radians)
-#           or ACB: copy-paste of training targets (Tong et al. 2024, src/augmentations/acb.py):
-#             crops a training target with context, augments the patch with RandAugment
-#             (num_ops ops from `ops`, magnitude 0..10) and blends it in at a random free spot
-#             with T' = T/max(T), I' = T'*T + (1-T')*I. Each paste gets its own box.
-#             Grid-search num_ops x magnitude (the paper's "auto" part), one run per point.
-#             Ablation "box copy only": num_ops: 0, fusion: none.
-#             ops: identity rotate flip scale brightness sharpness (default) contrast color
-#                  shear_x shear_y posterize solarize autocontrast equalize
-#   p:      probability per image
-#   params: keyword arguments of the transform / effect function
-# Images are uint8 (0..255); IR effects run on the grayscale channel.
+#
+# Four sections, each only accepts the names of its registry:
+#   sota        src/augmentations/sota.py        ACB, PGDAA (copy-paste of training targets)
+#   default     src/augmentations/default.py     generic Albumentations transforms
+#   edge_cases  src/augmentations/edge_cases.py  difficult detection cases (list still empty)
+#   ir          src/augmentations/ir.py          IR camera effects
+# order:   sequence of the sections; each section exactly once. Default: scene first
+#          (copy-paste), camera last (IR).
+# enabled: switches a section, a one_of group or a single entry on/off.
+# Entry:   {name, enabled, p, params}
+#            p:      probability per image
+#            params: keyword arguments of the transform / effect function
+# Group:   one_of: {enabled, p, pipeline: [entries]}
+#            mutually exclusive (albumentations.OneOf): with probability p exactly ONE enabled
+#            member runs; the members' p are only relative weights for which one is chosen.
+#            Groups cannot be nested.
+# Within a section the entries run in the listed order.
+# Images are grayscale uint8 (0..255); every augmentation keeps them uint8 HxW.
+#
+# ACB: copy-paste of training targets (Tong et al. 2024, src/augmentations/sota.py):
+#   crops a training target with context, augments the patch with RandAugment
+#   (num_ops ops from `ops`, magnitude 0..10) and blends it in at a random free spot
+#   with T' = T/max(T), I' = T'*T + (1-T')*I. Each paste gets its own box.
+#   Grid-search num_ops x magnitude (the paper's "auto" part), one run per point.
+#   Ablation "box copy only": num_ops: 0, fusion: none.
+#   ops: identity rotate flip scale brightness sharpness (default) contrast color
+#        shear_x shear_y posterize solarize autocontrast equalize
+#
+# PGDAA: PGDA adapted (Wang et al. 2022, src/augmentations/sota.py; needs `python src/main.py -l`).
+#   With probability p the sample is REPLACED by a synthetic image: a random train frame without
+#   target (B_O), with the subfigure split a random crop of it (side fraction crop_scale) resized to
+#   the frame size, plus num_targets bright library targets. Each target: flips/affine, elastic/
+#   grid/piecewise-affine distortion, scaled so its box area ratio is drawn from A (train boxes below
+#   max_area_ratio, x U(1 +- area_jitter)), Gaussian paste (gaussian_sigma px), SCR perception
+#   (SCR at the spot outside S = library SCR between scr_percentiles -> shifted to a random S value,
+#   then ColorJitter). Boxes = only the pasted targets.
+#   Offline synthesis ratio r of the paper <-> p = r / (1 + r)   (r = 1 -> p = 0.5).
+#   Ablations (paper Table V): subfigure_split: false | scr_perception: false | gaussian_sigma: 0
+#   Shape ops of the targets: target_ops (default DEFAULT_TARGET_OPS in sota.py).
+#   ACB and PGDAA should not both be on: PGDAA replaces the image that ACB pasted into.
+#
+# IR effects (src/augmentations/ir.py), listed in the physical chain
+# optics/motion -> sensor pattern -> temporal noise -> defect pixels:
+#   optical_blur / motion_blur: anisotropic Gaussian PSF (blurring_with_psf: sigma_0, rho = sigma_1/sigma_0,
+#                               theta in radians); optical: rho ~ 1, motion: rho < 1 (stretched along theta).
+#                               The PSF is centred, so the image does not shift and the boxes stay exact.
+#   fpn:          y = a*x + b (PRNU gain sigma_gain, DSNU offset sigma_offset in grey values), mode pixel|column|row
+#   stripe_noise: one offset per column (sigma_offset in grey values)
+#   netd:         temporal noise, sigma relative to [0, 1]
+#   salt_and_pepper: p = share of 0-pixels, q = share of 255-pixels
+#   histogram_shift / histogram_compression: section still open
 # -----------------------------------------------------------------------------
 augmentation:
   bbox:
     min_visibility: 0.3   # drop a box if less than 30% of it remains after a spatial transform
     clip: true
-  pipeline:
-    # --- copy-paste (put it first, so later transforms also act on the pasted targets) ---
-    - {name: ACB, enabled: false, p: 1.0, params: {num_targets: 1, num_ops: 2, magnitude: 5, context: 0.5, min_context_px: 4, fusion: adaptive}}
-    # --- geometric ---
-    - {name: HorizontalFlip, enabled: true,  p: 0.5}
-    - {name: VerticalFlip,   enabled: false, p: 0.5}
-    - {name: Affine,         enabled: false, p: 0.5, params: {scale: [0.8, 1.2], translate_percent: [-0.1, 0.1], rotate: [-10, 10]}}
-    # --- generic photometric ---
-    - {name: RandomBrightnessContrast, enabled: false, p: 0.5, params: {brightness_limit: 0.15, contrast_limit: 0.2}}
-    - {name: GaussNoise,     enabled: false, p: 0.5, params: {std_range: [0.01, 0.05]}}
-    - {name: GaussianBlur,   enabled: false, p: 0.3, params: {blur_limit: [3, 5]}}
-    - {name: CLAHE,          enabled: false, p: 0.3, params: {clip_limit: 2.0, tile_grid_size: [8, 8]}}
-    # --- IR sensor effects ---
-    - {name: ir.netd,                  enabled: false, p: 0.3, params: {sigma: 0.0159}}   # sigma relative to [0,1]
-    - {name: ir.fpn,                   enabled: false, p: 0.3, params: {sigma_gain: 0.02, sigma_offset: 3.0, mode: pixel}}    # y = a*x + b + n; offsets/noise in grey values
-    - {name: ir.fpn,                   enabled: false, p: 0.3, params: {sigma_offset: 3.0, mode: column}}                     # stripe noise
-    - {name: ir.histogram_shift,       enabled: false, p: 0.3, params: {delta_limit: 30}}
-    - {name: ir.histogram_compression, enabled: false, p: 0.3, params: {gamma_min: 0.3, gamma_max: 0.9}}
-    - {name: ir.salt_and_pepper,       enabled: false, p: 0.2, params: {p: 0.005, q: 0.005}}
-    - {name: ir.psf_blur,              enabled: false, p: 0.2, params: {sigma_0: 1.2, rho: 1.0}}               # optical blur (isotropic)
-    - {name: ir.psf_blur,              enabled: false, p: 0.2, params: {sigma_0: 2.0, rho: 0.15, theta: 0.0}}  # motion blur (stretched)
+  order: [sota, default, edge_cases, ir]
+
+  sota:
+    enabled: true
+    pipeline:
+      - {name: ACB, enabled: false, p: 1.0, params: {num_targets: 1, num_ops: 2, magnitude: 5, context: 0.5, min_context_px: 4, fusion: adaptive}}
+      - name: PGDAA
+        enabled: false
+        p: 0.5
+        params: {num_targets: 1, subfigure_split: true, crop_scale: [0.5, 1.0], max_area_ratio: 0.0015, area_jitter: 0.1,
+                 scr_perception: true, scr_percentiles: [20, 80], d: 20, gaussian_sigma: 1.0,
+                 color_jitter: {brightness: 0.1, contrast: 0.1}}
+
+  default:
+    enabled: true
+    pipeline:
+      # --- geometric ---
+      - {name: HorizontalFlip, enabled: true,  p: 0.5}
+      - {name: VerticalFlip,   enabled: false, p: 0.5}
+      - {name: Affine,         enabled: false, p: 0.5, params: {scale: [0.8, 1.2], translate_percent: [-0.1, 0.1], rotate: [-10, 10]}}
+      # --- photometric ---
+      - {name: RandomBrightnessContrast, enabled: false, p: 0.5, params: {brightness_limit: 0.15, contrast_limit: 0.2}}
+      - {name: GaussNoise,     enabled: false, p: 0.5, params: {std_range: [0.01, 0.05]}}
+      - {name: GaussianBlur,   enabled: false, p: 0.3, params: {blur_limit: [3, 5]}}
+      - {name: CLAHE,          enabled: false, p: 0.3, params: {clip_limit: 2.0, tile_grid_size: [8, 8]}}
+
+  edge_cases:
+    enabled: true
+    pipeline: []          # list still to be decided
+
+  ir:
+    enabled: true
+    pipeline:
+      - one_of:           # only optical OR motion blur
+          enabled: false
+          p: 0.2
+          pipeline:
+            - {name: optical_blur, p: 1.0, params: {sigma_0: 1.2, rho: 1.0}}
+            - {name: motion_blur,  p: 1.0, params: {sigma_0: 2.0, rho: 0.15, theta: 0.0}}
+      - one_of:           # only FPN OR stripe noise
+          enabled: false
+          p: 0.3
+          pipeline:
+            - {name: fpn,          p: 1.0, params: {sigma_gain: 0.02, sigma_offset: 3.0, mode: pixel}}
+            - {name: stripe_noise, p: 1.0, params: {sigma_offset: 3.0}}
+      - {name: netd,            enabled: false, p: 0.3, params: {sigma: 0.0159}}
+      - {name: salt_and_pepper, enabled: false, p: 0.2, params: {p: 0.005, q: 0.005}}
+      # --- open: section not decided yet ---
+      - {name: histogram_shift,       enabled: false, p: 0.3, params: {delta_limit: 30}}
+      - {name: histogram_compression, enabled: false, p: 0.3, params: {gamma_min: 0.3, gamma_max: 0.9}}

@@ -1,5 +1,13 @@
-"""IR sensor effects. Every function takes a grayscale uint8 HxW frame and returns one
-(see augmentations/uint8.py). They draw from the global NumPy RNG."""
+"""Section "ir" of the augmentation config: IR camera effects.
+
+Every function takes a grayscale uint8 HxW frame and returns one (see augmentations/uint8.py).
+They draw from the global NumPy RNG. `TRANSFORMS` (end of the file) is the registry of the
+names allowed in the `ir:` section of a run config.
+"""
+from functools import partial
+from typing import Callable
+
+import albumentations as A
 import cv2
 import numpy as np
 
@@ -98,6 +106,14 @@ def fpn(img,
     a = 1.0 + np.random.normal(0.0, sigma_gain, shapes[mode]) if sigma_gain > 0 else 1.0
     b = np.random.normal(0.0, sigma_offset, shapes[mode]) if sigma_offset > 0 else 0.0
     return to_uint8(a * img + b)
+
+def stripe_noise(img, sigma_offset=0.0):
+    """
+    Stripe noise (Fayyaz et al. 2022): one additive offset per column,
+        y(i, j) = x(i, j) + b(j),   b(j) ~ N(0, sigma_offset^2)   (in grey values)
+    Same as fpn(img, sigma_gain=0, sigma_offset=sigma_offset, mode="column").
+    """
+    return fpn(img, sigma_gain=0.0, sigma_offset=sigma_offset, mode="column")
 
 def salt_and_peper(img, p=0.005, q=0.005):
     """
@@ -215,3 +231,45 @@ def blurring_with_psf(img, sigma_0=2.0, rho=1.5, theta=0.0):
     #    filter2D computes a correlation; the kernel is point-symmetric (k(x,y) = k(-x,-y)),
     #    so this equals the convolution. BORDER_REFLECT = scipy's boundary='symm'.
     return cv2.filter2D(img, -1, kernel, borderType=cv2.BORDER_REFLECT)
+
+
+# ---------------------------------------------------------------------------
+# Registry of the `ir:` section
+# ---------------------------------------------------------------------------
+# Config name -> effect function (uint8 HxW in, uint8 HxW out).
+# Optical and motion blur are the same PSF model with different parameters:
+#   optical_blur: rho ~ 1 (isotropic / mildly anisotropic), motion_blur: rho < 1, stretched along theta.
+# The PSF is centred and point-symmetric, so the image does not shift and the boxes stay exact.
+IR_EFFECTS: dict[str, Callable[..., np.ndarray]] = {
+    "optical_blur": blurring_with_psf,
+    "motion_blur": blurring_with_psf,
+    "fpn": fpn,
+    "stripe_noise": stripe_noise,
+    "netd": netd_noise,
+    "salt_and_pepper": salt_and_peper,
+    "histogram_shift": thermal_histogram_shift,              # open: section not decided yet
+    "histogram_compression": thermal_histogram_compression,  # open: section not decided yet
+}
+
+
+class IRTransform(A.ImageOnlyTransform):
+    """Wraps one IR effect as a pixel-only Albumentations transform (boxes are unchanged)."""
+
+    def __init__(self, effect: str, fn_kwargs: dict | None = None, p: float = 0.5):
+        super().__init__(p=p)
+        if effect not in IR_EFFECTS:
+            raise KeyError(f"Unknown IR effect '{effect}'. Available: {sorted(IR_EFFECTS)}")
+        self.effect = effect
+        self.fn_kwargs = dict(fn_kwargs or {})
+
+    def apply(self, img: np.ndarray, **_) -> np.ndarray:
+        return IR_EFFECTS[self.effect](img, **self.fn_kwargs)
+
+    def get_transform_init_args_names(self):
+        return ("effect", "fn_kwargs")
+
+
+# Name in the `ir:` section -> factory(params, p=...) -> transform.
+# Unlike the other sections the effect parameters are passed as ONE dict, because an effect may
+# have its own parameter called `p` (salt_and_pepper: share of black pixels).
+TRANSFORMS: dict[str, Callable[..., A.BasicTransform]] = {name: partial(IRTransform, name) for name in IR_EFFECTS}

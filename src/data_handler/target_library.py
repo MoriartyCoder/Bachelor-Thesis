@@ -1,18 +1,21 @@
-"""Target library for PGDA: masked target cutouts from Anti-UAV410 (proof of concept).
+"""Target library for PGDA(A): masked target cutouts from the train split of all datasets.
+
+Builds the library. Reading it and pasting cutouts (used by the augmentation) is in
+augmentations/sota.py (`load_library`, `read_cutout`, `gaussian_paste`).
 
 Wang, Li, Huang, Wu, Jie, Tao: "Prior-Guided Data Augmentation for Infrared Small Target
 Detection", IEEE JSTARS 15 (2022), Sec. III.
 
-PGDA crops every training target *by its pixel mask* (the set T), pastes it with a
+PGDA crops *every* training target by its pixel mask (the set T), pastes it with a
 Gaussian-weighted mask ("Gaussian paste") and adjusts its intensity to the training SCR
 distribution ("SCR perception"). Our datasets only have boxes, so this module builds the set T
-differently:
+from pseudo masks. To stay close to "every training target", the default uses all datasets in
+``datasets`` and no tag filter; only targets whose pseudo mask fails are missing (mostly the faintest):
 
-1. Candidates: only frames whose target is clearly visible. Anti-UAV410 has per-frame tags in
-   ``IR_label.json``; a frame is used only if none of ``exclude_tags`` is set (default: all of
-   them). Frames near the HUD band or touching the image border are left out, and each sequence
-   is thinned (every ``stride``-th clean frame, at most ``max_per_seq``) because neighbouring
-   frames are near-duplicates.
+1. Candidates: frames with a target. Optionally (``require_tags`` / ``exclude_tags``) only frames
+   whose Anti-UAV410 tags in ``IR_label.json`` are not set (CST-AntiUAV has no tags). Frames near the
+   HUD band or touching the image border are left out, and each sequence is thinned (every
+   ``stride``-th frame, at most ``max_per_seq``) because neighbouring frames are near-duplicates.
 2. Pseudo mask: inside the box, the target is separated from its local background by a contrast
    threshold. The background is the ring (box +- d) minus (box +- gap), with d = 20 as PGDA's SCR
    neighbourhood. The polarity (bright/dark target) comes from the stronger extreme in the box.
@@ -27,7 +30,8 @@ mapping below is confirmed for these:
 Not documented: LR (always 0 in our copy), VE, IC. The README's thermal crossover is "TC",
 which is not a key here. Measured (notebook 05): VE is set on every frame without a target, so it
 is in effect out-of-view; IC frames have the lowest local contrast of all tags (median peak SCR ~3),
-which fits thermal crossover. The default excludes every tag ("better safe than sorry").
+which fits thermal crossover. The default uses no tag filter (PGDA uses every target); the
+first proof of concept excluded every tag (``require_tags=True, exclude_tags=TAG_KEYS``).
 
 Library layout (``config.LIBRARY_DIR``)::
 
@@ -53,7 +57,7 @@ import numpy as np
 import pandas as pd
 from PIL import Image
 
-from augmentations.acb import fuse
+from augmentations.sota import CSV_FILE, load_library
 from config import LIBRARY_DIR, DatasetName
 from data_handler.formats import FrameRecord
 from data_handler.sources import NoDataError, load_dataset_split
@@ -72,7 +76,6 @@ TAG_NAMES = {
 }
 
 INFO_FILE = "build_info.json"
-CSV_FILE = "library.csv"
 TARGETS_DIR = "targets"
 
 LIBRARY_COLUMNS = [
@@ -93,11 +96,11 @@ LIBRARY_COLUMNS = [
 class LibraryConfig:
     """Every knob of the library build; written to build_info.json."""
 
-    dataset: DatasetName = DatasetName.ANTI_UAV_410
+    datasets: tuple[DatasetName, ...] = tuple(DatasetName)  # all known datasets (train split)
     split: str = "train"
     # candidate selection
-    require_tags: bool = True               # False: untagged sequences too (no tag filter for them)
-    exclude_tags: tuple[str, ...] = TAG_KEYS  # a frame with any of these set is dropped
+    require_tags: bool = False              # True: only tagged sequences (only Anti-UAV410 has tags)
+    exclude_tags: tuple[str, ...] = ()      # a frame with any of these tags set is dropped (e.g. TAG_KEYS)
     size_classes: tuple[int, ...] = (0, 1, 2, 3)  # TS classes kept
     hud_rows: int = 96                      # window (box +- d) must start below this row
     stride: int = 10                        # every n-th clean frame per sequence
@@ -117,7 +120,11 @@ class LibraryConfig:
     pad: int = 2                            # border around the cutout
 
     def __post_init__(self) -> None:
-        self.dataset = DatasetName(self.dataset)
+        if isinstance(self.datasets, (str, DatasetName)):
+            self.datasets = (self.datasets,)
+        self.datasets = tuple(DatasetName(d) for d in self.datasets)
+        if not self.datasets:
+            raise ValueError("datasets is empty")
         self.exclude_tags = tuple(self.exclude_tags)
         self.size_classes = tuple(int(c) for c in self.size_classes)
         self.fill_range = tuple(float(v) for v in self.fill_range)
@@ -138,7 +145,7 @@ class LibraryConfig:
 
     def to_dict(self) -> dict:
         out = asdict(self)
-        out["dataset"] = self.dataset.value
+        out["datasets"] = [d.value for d in self.datasets]
         return out
 
 
@@ -235,9 +242,9 @@ def select_candidates(records: list[FrameRecord], tags: dict[str, dict[str, list
     clean = [c for c in with_ts if _clear_of_hud_and_border(c.record, cfg)]
     funnel["clear_of_hud_and_border"] = len(clean)
 
-    by_seq: dict[str, list[Candidate]] = defaultdict(list)
+    by_seq: dict[tuple[str, str], list[Candidate]] = defaultdict(list)
     for c in clean:
-        by_seq[c.record.seq].append(c)
+        by_seq[(c.record.dataset.value, c.record.seq)].append(c)
     selected = []
     for seq in sorted(by_seq):
         group = sorted(by_seq[seq], key=lambda c: c.record.frame_idx)[::cfg.stride]
@@ -430,13 +437,6 @@ def save_cutout(path: Path, gray: np.ndarray, mask: np.ndarray) -> None:
     Image.fromarray(la).save(path)  # (H, W, 2) uint8 -> mode "LA"
 
 
-def read_cutout(path) -> tuple[np.ndarray, np.ndarray]:
-    """(gray uint8, mask bool) of a library PNG."""
-    with Image.open(path) as im:
-        la = np.asarray(im.convert("LA"))
-    return la[..., 0].copy(), la[..., 1] > 127
-
-
 def _row(cut: TargetCut, cand: Candidate, tid: str, rel: str, cfg: LibraryConfig) -> dict:
     r, c, st = cand.record, cut.contrast, cut.stats
     tags = cand.tags or {}
@@ -474,11 +474,18 @@ def build_library(cfg: LibraryConfig | None = None, out_dir: Path = LIBRARY_DIR,
         shutil.rmtree(out_dir)
     start = time.perf_counter()
 
-    records = load_dataset_split(cfg.dataset, cfg.split)
-    if not records:
-        raise NoDataError(f"No frames in {cfg.dataset}/{cfg.split}.")
-    tags = load_frame_tags(cfg.dataset.root / cfg.split)
-    candidates, funnel = select_candidates(records, tags, cfg)
+    candidates, funnel = [], {}
+    for ds in cfg.datasets:
+        records = load_dataset_split(ds, cfg.split)
+        if not records:
+            logger.warning(f"No frames in {ds}/{cfg.split}, skipped.")
+            continue
+        logger.info(f"{ds}:")
+        cands, ds_funnel = select_candidates(records, load_frame_tags(ds.root / cfg.split), cfg)
+        candidates += cands
+        funnel[ds.value] = ds_funnel
+    if not candidates:
+        raise NoDataError(f"No candidates in {[d.value for d in cfg.datasets]}/{cfg.split}.")
 
     (out_dir / TARGETS_DIR).mkdir(parents=True)
     info = {"created": datetime.now().isoformat(timespec="seconds"), "status": "incomplete",
@@ -505,58 +512,14 @@ def build_library(cfg: LibraryConfig | None = None, out_dir: Path = LIBRARY_DIR,
 
     df = pd.DataFrame(rows, columns=LIBRARY_COLUMNS)
     df.to_csv(out_dir / CSV_FILE, index=False)
-    funnel["saved"] = len(df)
+    for ds_name, ds_funnel in funnel.items():
+        ds_funnel["saved"] = int((df.dataset == ds_name).sum())
+    n_seq = int(df.groupby(["dataset", "seq"]).ngroups)
     info.update({"status": "complete", "funnel": funnel, "segmentation": dict(reasons.most_common()),
-                 "n_targets": len(df), "n_sequences": int(df.seq.nunique()),
+                 "n_targets": len(df), "n_sequences": n_seq,
+                 "per_dataset": df.dataset.value_counts().to_dict(),
                  "duration_s": round(time.perf_counter() - start, 1)})
     (out_dir / INFO_FILE).write_text(json.dumps(info, indent=2), encoding="utf-8")
-    logger.info(f"Library: {len(df)} targets from {df.seq.nunique()} sequences -> {out_dir} "
+    logger.info(f"Library: {len(df)} targets from {n_seq} sequences {info['per_dataset']} -> {out_dir} "
                 f"({info['duration_s']} s). Segmentation: {dict(reasons.most_common())}")
     return load_library(out_dir)
-
-
-def load_library(lib_dir: Path = LIBRARY_DIR) -> pd.DataFrame:
-    """The library table with an absolute `path` column per cutout."""
-    lib_dir = Path(lib_dir)
-    csv_path = lib_dir / CSV_FILE
-    if not csv_path.exists():
-        raise FileNotFoundError(f"{csv_path} not found. Build the library first (notebook 05, build_library).")
-    df = pd.read_csv(csv_path)
-    df["path"] = [str(lib_dir / f) for f in df.file]
-    return df
-
-
-# ---------------------------------------------------------------------------
-# Paste (PGDA "Gaussian paste")
-# ---------------------------------------------------------------------------
-def gaussian_weights(mask: np.ndarray, sigma: float) -> np.ndarray:
-    """Weight map of the target pixels: Gaussian-blurred mask, scaled to max 1, 0 outside the mask.
-
-    Restricting it to the mask matters: the cutout is 0 outside the mask, so weights there would
-    blend black into the background. sigma = 0 gives the hard mask.
-    """
-    m = mask.astype(np.float32)
-    if sigma <= 0 or not mask.any():
-        return m
-    w = cv2.GaussianBlur(m, (0, 0), sigma) * m
-    return w / w.max()
-
-
-def gaussian_paste(image: np.ndarray, gray: np.ndarray, mask: np.ndarray, x: int, y: int,
-                   sigma: float = 1.0, box=None) -> tuple[np.ndarray, tuple[float, float, float, float]]:
-    """Paste a cutout with its top-left corner at (x, y): I' = w * T + (1 - w) * I.
-
-    `box` (x, y, w, h) in cutout coordinates is the label to carry over (default: tight mask box).
-    Returns the new image and the pasted box in image coordinates.
-    """
-    h, w = gray.shape
-    H, W = image.shape[:2]
-    if not (0 <= x and 0 <= y and x + w <= W and y + h <= H):
-        raise ValueError(f"Cutout {w}x{h} at ({x}, {y}) does not fit into {W}x{H}.")
-    if box is None:
-        ys, xs = np.nonzero(mask)
-        box = (xs.min(), ys.min(), xs.max() + 1 - xs.min(), ys.max() + 1 - ys.min())
-    out = image.copy()
-    out[y:y + h, x:x + w] = fuse(out[y:y + h, x:x + w], gray, gaussian_weights(mask, sigma))
-    bx, by, bw, bh = (float(v) for v in box)
-    return out, (x + bx, y + by, bw, bh)

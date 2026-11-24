@@ -26,7 +26,7 @@ def cli_handler(argv: list[str] | None = None) -> argparse.Namespace:
                              + ", ".join(f"{k}={v}" for k, v in sorted(PREPARE_IDS.items())) + ")")
 
     parser.add_argument("-l", "--build-library", action="store_true",
-                        help="(re)build the PGDA target library in data/library/ from Anti-UAV410/train "
+                        help="(re)build the PGDA target library in data/library/ from the train split of all datasets "
                              "with the default LibraryConfig; an existing library is replaced")
 
     parser.add_argument("-t", "--train", action="store_true",

@@ -7,27 +7,21 @@ Ultralytics results + TensorBoard logs, checkpoints in weights/ and optional tes
 from __future__ import annotations
 
 import json
-import platform
-import random
 import shutil
-import subprocess
-import sys
 import time
 from contextlib import contextmanager
 from datetime import datetime
-from enum import Enum
 from pathlib import Path
 
 import cv2
-import numpy as np
-import torch
 import yaml
 
 import config
-from augmentations.pipeline import build_albumentations, describe_pipeline
+from data_handler.augmentation import build_albumentations, describe_pipeline
 from data_handler.sources import NoDataError, collect_split, write_manifest
 from log_setup import add_log_file, get_logger, remove_log_file
-from utils.utils import auto_device
+from models.yolo import resolve_device, resolve_model_weights
+from utils.utils import env_info, git, plain, seed_everything
 
 logger = get_logger(__name__)
 
@@ -46,96 +40,15 @@ def step(name: str):
     logger.info(f"{name}: done in {time.perf_counter() - start:.1f} s")
 
 
-def _plain(o):
-    """Config values -> YAML/log friendly (Path/Enum -> str)."""
-    if isinstance(o, dict):
-        return {k: _plain(v) for k, v in o.items()}
-    if isinstance(o, (list, tuple)):
-        return [_plain(v) for v in o]
-    if isinstance(o, Enum):
-        return o.value
-    return str(o) if isinstance(o, Path) else o
-
-
-def resolve_device(device):
-    """'auto' -> 0 (first NVIDIA GPU) if CUDA is available, else 'cpu'. Other values pass through."""
-    if device in (None, "auto"):
-        resolved = 0 if auto_device() == "cuda" else "cpu"
-        logger.debug(f"device 'auto' -> {resolved!r}")
-        return resolved
-    return device
-
-
-def resolve_model_weights(weights: str) -> str:
-    """Bare model names (e.g. yolo26n.pt) are kept in weights/pretrained/ instead of the cwd."""
-    p = Path(weights)
-    local = config._resolve(p)
-    if local.exists():
-        logger.debug(f"model weights: local file {local}")
-        return str(local)
-    if p.suffix != ".pt" or len(p.parts) > 1:  # e.g. yolo26n.yaml (built-in architecture) -> let ultralytics resolve
-        logger.debug(f"model weights: '{weights}' resolved by ultralytics")
-        return weights
-    from ultralytics.utils.downloads import attempt_download_asset
-
-    target = config.WEIGHTS_DIR / "pretrained" / p.name
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if not target.exists():
-        logger.info(f"Downloading pretrained weights {p.name} -> {target.parent}")
-        downloaded = Path(attempt_download_asset(p.name))
-        if downloaded.resolve() != target.resolve():
-            shutil.move(str(downloaded), target)
-    logger.debug(f"model weights: {target}")
-    return str(target)
-
-
-def seed_everything(seed: int, deterministic: bool) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = deterministic
-    torch.backends.cudnn.benchmark = not deterministic
-
-
-def _git(*args) -> str:
-    try:
-        return subprocess.run(["git", *args], cwd=config.ROOT_DIR, capture_output=True, text=True, check=True).stdout
-    except Exception as e:  # no git / not a repo
-        return f"<git {' '.join(args)} failed: {e}>"
-
-
-def env_info(device) -> str:
-    import albumentations
-    import ultralytics
-
-    lines = [
-        f"python        {sys.version.split()[0]} ({platform.platform()})",
-        f"torch         {torch.__version__} (cuda build {torch.version.cuda})",
-        f"ultralytics   {ultralytics.__version__}",
-        f"albumentations {albumentations.__version__}",
-        f"opencv        {cv2.__version__}",
-        f"device        {device}",
-    ]
-    if torch.cuda.is_available():
-        for i in range(torch.cuda.device_count()):
-            prop = torch.cuda.get_device_properties(i)
-            lines.append(f"gpu{i}          {prop.name}, {prop.total_memory / 2**30:.1f} GiB")
-    else:
-        lines.append("gpu           none (CUDA not available)")
-    return "\n".join(lines)
-
-
 def write_snapshots(run_dir: Path, cfg_path: Path, cfg: dict, overrides: dict, device) -> None:
     shutil.copy(cfg_path, run_dir / "config.yaml")
     resolved = {k: v for k, v in cfg.items()}
     resolved["ultralytics_overrides"] = overrides
-    (run_dir / "config.resolved.yaml").write_text(yaml.safe_dump(_plain(resolved), sort_keys=False), encoding="utf-8")
+    (run_dir / "config.resolved.yaml").write_text(yaml.safe_dump(plain(resolved), sort_keys=False), encoding="utf-8")
     (run_dir / "augmentation.txt").write_text(describe_pipeline(cfg["augmentation"]) + "\n", encoding="utf-8")
-    status = _git("status", "--porcelain")
-    git_txt = f"commit: {_git('rev-parse', 'HEAD').strip()}\nbranch: {_git('rev-parse', '--abbrev-ref', 'HEAD').strip()}\n"
-    git_txt += f"dirty:  {bool(status.strip())}\n\n--- status ---\n{status}\n--- diff ---\n{_git('diff')}"
+    status = git("status", "--porcelain")
+    git_txt = f"commit: {git('rev-parse', 'HEAD').strip()}\nbranch: {git('rev-parse', '--abbrev-ref', 'HEAD').strip()}\n"
+    git_txt += f"dirty:  {bool(status.strip())}\n\n--- status ---\n{status}\n--- diff ---\n{git('diff')}"
     (run_dir / "git.txt").write_text(git_txt, encoding="utf-8")
     (run_dir / "env.txt").write_text(env_info(device) + "\n", encoding="utf-8")
     logger.debug(f"Snapshots written: config.yaml, config.resolved.yaml, augmentation.txt, git.txt, env.txt "
@@ -154,7 +67,7 @@ def save_previews(records, albu, cfg_overrides: dict, out_dir: Path, n: int = 16
     """Run frames through the real training dataset (Albumentations + letterbox) and draw the boxes."""
     from ultralytics.cfg import get_cfg
 
-    from training.yolo_dataset import build_record_dataset
+    from data_handler.yolo_dataset import build_record_dataset
 
     out_dir.mkdir(parents=True, exist_ok=True)
     with_box = [r for r in records if r.bbox is not None][: n // 2]
@@ -185,7 +98,7 @@ def run(cfg_path: str | Path, dry_run: bool = False) -> Path:
     cfg_path = Path(cfg_path).resolve()
     logger.info(f"Run config: {cfg_path}" + ("  [DRY RUN]" if dry_run else ""))
     cfg = config.load_run_config(cfg_path)
-    logger.debug("Resolved run config:\n" + yaml.safe_dump(_plain(cfg), sort_keys=False))
+    logger.debug("Resolved run config:\n" + yaml.safe_dump(plain(cfg), sort_keys=False))
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     output_root = config.OUTPUT_DIR / "dryrun" if dry_run else Path(cfg["run"]["output_root"])
@@ -230,6 +143,9 @@ def _run(cfg: dict, cfg_path: Path, run_dir: Path, output_root: Path, timestamp:
                     continue
                 raise
 
+    # Copy sources and priors of the augmentation (ACB, PGDAA) always come from the full train split,
+    # also in a dry run (a 32-frame subset may have no background frame at all).
+    aug_records = split_records["train"]
     if dry_run:  # tiny, fast subsets
         split_records = {s: r[:: max(1, len(r) // 32)][:32] for s, r in split_records.items()}
         logger.info("Dry run: reduced to " + ", ".join(f"{s}={len(r)}" for s, r in split_records.items()) + " frames")
@@ -238,7 +154,7 @@ def _run(cfg: dict, cfg_path: Path, run_dir: Path, output_root: Path, timestamp:
     data_yaml = write_data_yaml(run_dir, manifest_txts)
 
     # --- augmentation ------------------------------------------------------
-    albu = build_albumentations(cfg["augmentation"], train_records=split_records["train"])
+    albu = build_albumentations(cfg["augmentation"], train_records=aug_records)
     logger.info(describe_pipeline(cfg["augmentation"]))
     logger.debug(f"Albumentations Compose:\n{albu}")
 
@@ -262,7 +178,7 @@ def _run(cfg: dict, cfg_path: Path, run_dir: Path, output_root: Path, timestamp:
         "deterministic": run_cfg["deterministic"],
         **config.ULTRALYTICS_AUG_OFF,  # last: can never be overridden
     }
-    logger.debug("Ultralytics overrides:\n" + yaml.safe_dump(_plain(overrides), sort_keys=False))
+    logger.debug("Ultralytics overrides:\n" + yaml.safe_dump(plain(overrides), sort_keys=False))
     write_snapshots(run_dir, cfg_path, cfg, overrides, device)
 
     if dry_run:
