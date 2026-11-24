@@ -1,15 +1,18 @@
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
+from typing import Any
+
+import yaml
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT_DIR / "data"
 OUTPUT_DIR = ROOT_DIR / "output"
 NOTEBOOKS_DIR = ROOT_DIR / "notebooks"
 LOGS_DIR = ROOT_DIR / "logs"
+WEIGHTS_DIR = ROOT_DIR / "weights"
+CONFIGS_DIR = ROOT_DIR / "configs"
 
-DATA_TEST_DIR = DATA_DIR / "Anti-UAV-RGBT" / "train"
-DATA_VAL_DIR  = DATA_DIR / "Anti-UAV-RGBT" / "val"
-DATA_TEST_DIR = DATA_DIR / "Anti-UAV-RGBT" / "test"
 
 ENSURE_DIRS_TO_EXIST = [DATA_DIR, OUTPUT_DIR]
 for dir in ENSURE_DIRS_TO_EXIST:
@@ -19,8 +22,146 @@ TRAIN_MEAN = 82.34 # 82.34215282752244
 TRAIN_STD  = 50.87 # 50.86908839649263
 
 
+# ---------------------------------------------------------------------------
+# Datasets
+# ---------------------------------------------------------------------------
+class DatasetName(str, Enum):
+    """All known datasets. Value = folder name in data/ (and name of its .zip).
+
+    A member is a singleton, so every FrameRecord only holds a reference to it.
+    New dataset: add a member here (+ an entry in PREPARE_IDS if it has a zip to extract).
+    """
+    ANTI_UAV_410 = "Anti-UAV410"
+    CST_ANTI_UAV = "CST-AntiUAV"
+
+    def __str__(self) -> str:  # "Anti-UAV410" instead of "DatasetName.ANTI_UAV_410"
+        return self.value
+
+    @property
+    def root(self) -> Path:
+        return DATA_DIR / self.value
+
+    @property
+    def zip_path(self) -> Path:
+        return DATA_DIR / f"{self.value}.zip"
+
+
+# Short ids for `python src/main.py -p <id>`
+PREPARE_IDS: dict[int, DatasetName] = {
+    100: DatasetName.CST_ANTI_UAV,
+    410: DatasetName.ANTI_UAV_410,
+}
+
+
 OPTIMIZER_REGISTRY = []
 SCHEDULER_REGISTRY = []
+
+
+# ---------------------------------------------------------------------------
+# Run configuration (YAML, see configs/template.yaml)
+# ---------------------------------------------------------------------------
+
+# Every Ultralytics-internal augmentation, forced off. Merged LAST into the
+# trainer overrides so no config can switch one on. Albumentations (see
+# augmentations/pipeline.py) is the only augmentation source.
+ULTRALYTICS_AUG_OFF: dict[str, Any] = {
+    "hsv_h": 0.0, "hsv_s": 0.0, "hsv_v": 0.0,
+    "degrees": 0.0, "translate": 0.0, "scale": 0.0, "shear": 0.0, "perspective": 0.0,
+    "flipud": 0.0, "fliplr": 0.0, "bgr": 0.0,
+    "mosaic": 0.0, "mixup": 0.0, "cutmix": 0.0, "copy_paste": 0.0,
+    "close_mosaic": 0, "multi_scale": 0.0, "erasing": 0.0,
+}
+
+# Keys the run code sets itself; they must not appear in the `train:` section.
+_MANAGED_TRAIN_KEYS = {
+    "model", "data", "imgsz", "project", "name", "exist_ok", "save_period", "seed", "deterministic",
+}
+
+_TOP_LEVEL_KEYS = {"run", "datasets", "sampling", "model", "train", "augmentation"}
+SPLITS = ("train", "val", "test")
+
+
+class ConfigError(ValueError):
+    """Invalid run configuration."""
+
+
+def _resolve(path: str | Path) -> Path:
+    p = Path(path)
+    return p if p.is_absolute() else (ROOT_DIR / p).resolve()
+
+
+def load_run_config(path: str | Path) -> dict[str, Any]:
+    """Load and validate a run config YAML. Relative paths are resolved against ROOT_DIR."""
+    path = Path(path)
+    with open(path, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+
+    unknown = set(cfg) - _TOP_LEVEL_KEYS
+    if unknown:
+        raise ConfigError(f"Unknown top-level keys {sorted(unknown)}. Allowed: {sorted(_TOP_LEVEL_KEYS)}")
+    missing = {"datasets", "sampling", "model", "train"} - set(cfg)
+    if missing:
+        raise ConfigError(f"Missing sections: {sorted(missing)}")
+
+    run = cfg.setdefault("run", {})
+    run.setdefault("seed", 42)
+    run.setdefault("deterministic", True)
+    run.setdefault("checkpoint_every_n_epochs", -1)
+    run.setdefault("test_after_training", True)
+    run["output_root"] = _resolve(run.get("output_root", WEIGHTS_DIR))
+
+    if not cfg["datasets"]:
+        raise ConfigError("`datasets` is empty.")
+    for ds in cfg["datasets"]:
+        if "name" not in ds:
+            raise ConfigError(f"Dataset entry {ds} is missing `name`.")
+        try:
+            ds["name"] = DatasetName(ds["name"])
+        except ValueError:
+            raise ConfigError(
+                f"Unknown dataset '{ds['name']}'. Known: {[d.value for d in DatasetName]} "
+                "(add new ones to config.DatasetName)."
+            ) from None
+        ds.setdefault("format", "default")
+        ds.setdefault("enabled", True)
+        ds["root"] = _resolve(ds["root"]) if "root" in ds else ds["name"].root
+
+    for split in SPLITS:
+        if split not in cfg["sampling"]:
+            raise ConfigError(f"`sampling.{split}` is missing.")
+        if "method" not in cfg["sampling"][split]:
+            raise ConfigError(f"`sampling.{split}.method` is missing.")
+
+    if "weights" not in cfg["model"]:
+        raise ConfigError("`model.weights` is missing (e.g. yolo26n.pt or a model .yaml).")
+    cfg["model"].setdefault("imgsz", 640)
+
+    train = cfg["train"] or {}
+    cfg["train"] = train
+    forbidden = set(train) & set(ULTRALYTICS_AUG_OFF)
+    if forbidden:
+        raise ConfigError(
+            f"Ultralytics augmentation keys {sorted(forbidden)} are not allowed in `train:`. "
+            "They are always disabled; use the `augmentation:` section instead."
+        )
+    managed = set(train) & _MANAGED_TRAIN_KEYS
+    if managed:
+        raise ConfigError(
+            f"Keys {sorted(managed)} are set from other sections (run/model) and must not appear in `train:`."
+        )
+    train.setdefault("device", "auto")
+
+    aug = cfg.setdefault("augmentation", {})
+    aug.setdefault("bbox", {})
+    aug.setdefault("pipeline", [])
+    for entry in aug["pipeline"]:
+        if "name" not in entry:
+            raise ConfigError(f"Augmentation entry {entry} is missing `name`.")
+        entry.setdefault("enabled", True)
+        entry.setdefault("p", 1.0)
+        entry.setdefault("params", {})
+
+    return cfg
 
 
 TEMPLATE_CONFIG = {

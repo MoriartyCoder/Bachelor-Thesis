@@ -1,156 +1,53 @@
-import os
-import subprocess
-from config import DATA_DIR
+"""Extract a downloaded dataset zip from data/ into data/<dataset>/.
+
+Called via `python src/main.py -p <id>`. The target folder is DELETED and recreated.
+"""
 import json
-import cv2
-from pathlib import Path
 import shutil
+import subprocess
+import time
+from pathlib import Path
+
+from config import DatasetName
+from log_setup import get_logger
+
+logger = get_logger(__name__)
 
 
-# Copied from framecut.py (See Anti-UAV-RGBT)
-def video2image(video_path, type:str="jpg"):
-    cap = cv2.VideoCapture(video_path)
-    frame_count = 0
-    success = True
-    print('read video in', video_path)
-
-    if type == "jpg":
-        params = [cv2.IMWRITE_JPEG_QUALITY, 95]
-    elif type == "png":
-        params = [cv2.IMWRITE_PNG_COMPRESSION, 1]
-
-    while success:
-        success, frame = cap.read()
-        if not success:
-            break
-        
-        #print("Frame %d" %frame_count)
-        cv2.imwrite(video_path.parent / "{}.{}".format(str(frame_count).zfill(6), type), frame, params)
-        frame_count = frame_count + 1
-    cap.release()
-
-# Copied from framecut.py (See Anti-UAV-RGBT)
-def get_all_dir(root_dir):
-    video_pathes = []
-    for dir in os.listdir(root_dir):
-        dir = os.path.join(root_dir, dir)
-        if os.path.isdir(dir):
-            video_pathes.extend(get_all_dir(dir))
-        if dir[-4:] == '.mp4':
-            video_pathes.append(Path(dir))
-    return video_pathes
-
-def reformat_json_file(file_path):
+def reformat_json_file(file_path: Path) -> None:
+    """Rewrite a JSON file indented (the original label files are one long line)."""
     with open(file_path, "r", encoding="utf-8") as f:
-        data = json.load(f) 
-
-    # 2. Strukturiert und formatiert in eine neue Datei speichern
+        data = json.load(f)
     with open(file_path, "w", encoding="utf-8") as f:
-        json.dump(
-            data, 
-            f, 
-            indent=4,           # Sorgt für die saubere Einrückung (Strukturierung)
-            ensure_ascii=False  # Verhindert, dass Umlaute als Code (z.B. \u00fc) angezeigt werden
+        json.dump(data, f, indent=4, ensure_ascii=False)
+
+
+def prepare_dataset(dataset: DatasetName) -> Path:
+    start = time.perf_counter()
+    archive, target = dataset.zip_path, dataset.root
+    logger.info(f"[{dataset}] Prepare: {archive} -> {target}")
+
+    if not archive.exists():
+        raise FileNotFoundError(
+            f"'{archive.name}' not found in {archive.parent}. Download the dataset once manually "
+            f"in the browser and save it as {archive}."
         )
 
+    if target.exists():
+        logger.info(f"[{dataset}] Deleting existing folder {target}")
+        shutil.rmtree(target)
 
-def prepare_anti_uav_300():
-    ANTI_UAV_300_DIR_NAME = "Anti-UAV-RGBT"
-    ANTI_UAV_300_DIR_PATH = DATA_DIR / ANTI_UAV_300_DIR_NAME
-    ZIP_NAME = "Anti-UAV-RGBT.zip"
-    archive_path = os.path.join(DATA_DIR, ZIP_NAME)
+    logger.info(f"[{dataset}] Extracting with 'unzip' ...")
+    subprocess.run(["unzip", "-q", str(archive), "-d", str(target)], check=True)
 
-    print(f"=== 1. Prüfe das Archiv in {DATA_DIR} ===")
-    if not os.path.exists(archive_path):
-        print(f"\n[!] FEHLER: Die Datei '{ZIP_NAME}' wurde nicht in '{DATA_DIR}' gefunden.")
-        print(f"Lade das Dataset einmalig manuell im Browser herunter und lege es als '{ZIP_NAME}' in den Ordner '{DATA_DIR}/'.")
-        exit(1)
-
-    if os.path.exists(ANTI_UAV_300_DIR_PATH):
-        shutil.rmtree(ANTI_UAV_300_DIR_PATH)
-
-    print("=== 2. Entpacke Archiv mit 'unzip' ===")
-    # Ruft den echten Bash-Befehl 'unzip' auf
-    subprocess.run(["unzip", "-q", str(archive_path), "-d", str(ANTI_UAV_300_DIR_PATH)], check=True)
-    print("Entpacken erfolgreich abgeschlossen.")
-
-    print("=== 3. Bereinige train, test und val (lösche visible.mp4 & visible.json) ===")
-    # Nutzt den echten Bash-Befehl 'find' mit -delete
-    for split in ["train", "test", "val"]:
-        split_dir = os.path.join(ANTI_UAV_300_DIR_PATH, split)
-        if os.path.exists(split_dir):
-            print(f"Bereinige Verzeichnis: {split_dir}")
-            find_cmd = f"find '{split_dir}' -type f \\( -name 'visible.mp4' -o -name 'visible.json' \\) -delete"
-            subprocess.run(find_cmd, shell=True, check=True)
-        else:
-            print(f"Hinweis: Ordner '{split_dir}' existiert nicht (wird übersprungen).")
-
-    print("=== 4. Split video into frames ===")
-    video_pathes = get_all_dir(ANTI_UAV_300_DIR_PATH)
-    for vid, video_path in enumerate(video_pathes):
-        video2image(video_path)
-        os.unlink(video_path)
-
-    print("=== 5. Update formatting of some json-files ===")
-    for file_name in ["test.json", "train.json", "val.json"]:
-        file_path = ANTI_UAV_300_DIR_PATH / "label_new" / file_name
-
-        if not file_path.exists():
-            print(f"File not found. Not formatted. File: {file_path}")
-            continue
-
+    json_files = sorted(target.rglob("*.json"))
+    logger.info(f"[{dataset}] Reformatting {len(json_files)} JSON label files")
+    for file_path in json_files:
+        logger.debug(f"[{dataset}] reformat {file_path.relative_to(target)}")
         reformat_json_file(file_path)
 
-    print(f"\n=== Fertig! Datensatz in {DATA_DIR} ist bereit und bereinigt. ===")
-
-
-
-def prepare_anti_uav_410():
-    ANTI_UAV_410_DIR_NAME = "Anti-UAV410"
-    ANTI_UAV_410_DIR_PATH = DATA_DIR / ANTI_UAV_410_DIR_NAME
-    ZIP_NAME = "Anti-UAV410.zip"
-    archive_path = os.path.join(DATA_DIR, ZIP_NAME)
-
-    print(f"=== 1. Prüfe das Archiv in {DATA_DIR} ===")
-    if not os.path.exists(archive_path):
-        print(f"\n[!] FEHLER: Die Datei '{ZIP_NAME}' wurde nicht in '{DATA_DIR}' gefunden.")
-        print(f"Lade das Dataset einmalig manuell im Browser herunter und lege es als '{ZIP_NAME}' in den Ordner '{DATA_DIR}/'.")
-        exit(1)
-
-    if os.path.exists(ANTI_UAV_410_DIR_PATH):
-        shutil.rmtree(ANTI_UAV_410_DIR_PATH)
-
-    print("=== 2. Entpacke Archiv mit 'unzip' ===")
-    # Ruft den echten Bash-Befehl 'unzip' auf
-    subprocess.run(["unzip", "-q", str(archive_path), "-d", str(ANTI_UAV_410_DIR_PATH)], check=True)
-    print("Entpacken erfolgreich abgeschlossen.")
-
-    print("=== 3. Reformat json files ===")
-    for file_path in Path(ANTI_UAV_410_DIR_PATH).rglob("*.json"):
-        reformat_json_file(file_path)
-
-
-
-def prepare_anti_uav_cst():
-    CST_ANTI_UAV_DIR_NAME = "CST-AntiUAV"
-    CST_ANTI_UAV_DIR_PATH = DATA_DIR / CST_ANTI_UAV_DIR_NAME
-    ZIP_NAME = "CST-AntiUAV.zip"
-    archive_path = os.path.join(DATA_DIR, ZIP_NAME)
-
-    print(f"=== 1. Prüfe das Archiv in {DATA_DIR} ===")
-    if not os.path.exists(archive_path):
-        print(f"\n[!] FEHLER: Die Datei '{ZIP_NAME}' wurde nicht in '{DATA_DIR}' gefunden.")
-        print(f"Lade das Dataset einmalig manuell im Browser herunter und lege es als '{ZIP_NAME}' in den Ordner '{DATA_DIR}/'.")
-        exit(1)
-
-    if os.path.exists(CST_ANTI_UAV_DIR_PATH):
-        shutil.rmtree(CST_ANTI_UAV_DIR_PATH)
-
-    print("=== 2. Entpacke Archiv mit 'unzip' ===")
-    # Ruft den echten Bash-Befehl 'unzip' auf
-    subprocess.run(["unzip", "-q", str(archive_path), "-d", str(CST_ANTI_UAV_DIR_PATH)], check=True)
-    print("Entpacken erfolgreich abgeschlossen.")
-
-    print("=== 3. Reformat json files ===")
-    for file_path in Path(CST_ANTI_UAV_DIR_PATH).rglob("*.json"):
-        reformat_json_file(file_path)
+    for split_dir in sorted(p for p in target.iterdir() if p.is_dir()):
+        n_seq = sum(1 for p in split_dir.iterdir() if p.is_dir())
+        logger.info(f"[{dataset}]   {split_dir.name}/: {n_seq} sequences")
+    logger.info(f"[{dataset}] Done in {time.perf_counter() - start:.1f} s")
+    return target

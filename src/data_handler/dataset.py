@@ -1,11 +1,14 @@
-import json
+from collections.abc import Iterable
+from pathlib import Path
 
+import albumentations as A
 import cv2
+import numpy as np
 import torch
 from torch.utils.data import Dataset
-from pathlib import Path
-import albumentations as A
-import numpy as np
+
+from config import DatasetName
+from data_handler.sources import load_dataset_split
 
 def sinusoidal_intensity_mapping(image):
     """
@@ -90,83 +93,64 @@ ir_augmentation_pipeline_bkg = A.Compose([
 class AugmentationError(Exception):
     """Something went wrong while augmentation."""
 
+
 class AntiUAVDataset(Dataset):
-    def __init__(self, dataset_root_dir, transform=None, debug=False):
-        self.dataset_root_dir = Path(dataset_root_dir)
-        self.samples = []  # Flache Liste für alle einzelnen Frames
+    """Frames of one split of one or several datasets (for the notebooks, not for training).
+
+    Uses the same loader as training (FrameRecords), so labels are read identically.
+        AntiUAVDataset(DatasetName.ANTI_UAV_410)                  # one dataset
+        AntiUAVDataset([DatasetName.ANTI_UAV_410,
+                        DatasetName.CST_ANTI_UAV], split="val")   # both, concatenated in this order
+    Returns (image tensor [1,H,W] in [0,1], target dict, original grayscale image).
+    """
+
+    def __init__(self, datasets: DatasetName | Iterable[DatasetName], split: str = "train",
+                 transform=None, debug=False):
+        self.datasets = [datasets] if isinstance(datasets, DatasetName) else list(datasets)
+        self.split = split
         self.debug = debug
-
-        if debug:
-            self.reverse_path = {}
-
-        # 1. Ordnerstruktur durchlaufen und alle Bilder + Labels einsammeln
-        # Wir suchen nach allen Sequenz-Ordnern im Split (z.B. train/val/test)
-        for seq_dir in self.dataset_root_dir.iterdir():
-            if not seq_dir.is_dir():
-                continue
-            
-            with open(seq_dir / "IR_label.json", 'r') as f:
-                annotations_data = json.load(f)
-
-            # Alle Bilder in dieser Sequenz finden
-            img_paths = sorted(list(seq_dir.glob("*.jpg")))
-            
-            for i, img_path in enumerate(img_paths):
-                
-                self.samples.append({
-                    'img_path': img_path,
-                    'bbox': annotations_data.get("gt_rect", annotations_data["gt"])[i],
-                    'exist': annotations_data["exist"][i]
-                })
-
-                if debug:
-                    self.reverse_path[str(img_path)] = len(self.samples) - 1
-
+        self.samples = [r for ds in self.datasets for r in load_dataset_split(ds, split)]
         self.transform = transform if transform is not None else ir_augmentation_pipeline
-
+        if debug:
+            self.reverse_path = {r.img_path: i for i, r in enumerate(self.samples)}
 
     def __len__(self) -> int:
         return len(self.samples)
 
-    def get_index_by_path(self, target_path: Path | str) -> Path | None:
-        '''
-        Horrible helper function.
-        Absolute path to the image.
-        '''
+    def get_index_by_path(self, target_path: Path | str) -> int | None:
+        """Index of an image by its absolute path (only with debug=True)."""
         return self.reverse_path.get(str(target_path), None)
-
-
 
     def __getitem__(self, idx):
         sample       = self.samples[idx]
-        boxes        = [sample['bbox']] if sample['exist'] == 1 else []
+        boxes        = [list(sample.bbox)] if sample.bbox is not None else []
         class_labels = [0] if boxes else []
-        
-        # 3. Bild laden (Infrarot als Grayscale)
-        img = cv2.imread(str(sample['img_path']), cv2.IMREAD_GRAYSCALE)
-        if img is None:
-            raise FileNotFoundError(f"Konnte Bild nicht laden: {sample['img_path']}")
 
+        # Bild laden (Infrarot als Grayscale)
+        img = cv2.imread(sample.img_path, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            raise FileNotFoundError(f"Konnte Bild nicht laden: {sample.img_path}")
+
+        augmented = {}
+        img_augmented = img
         if self.transform:
             try:
-                augmented = self.transform(
-                    image=img,
-                    bboxes=boxes,
-                    class_labels=class_labels
-                )
-                img_augmented = augmented['image']
-                boxes = augmented['bboxes']
-                #class_labels = augmented['class_labels']
+                augmented = self.transform(image=img, bboxes=boxes, class_labels=class_labels)
             except Exception as e:
                 # Falls z.B. eine Box durch Augmentierung aus dem Bild fliegt
-                raise AugmentationError(f"{str(sample['img_path'])} couldn't be augmentated!")
+                raise AugmentationError(f"{sample.img_path} couldn't be augmentated!") from e
+            img_augmented = augmented["image"]
+            boxes = augmented["bboxes"]
 
         img_tensor = torch.tensor(img_augmented, dtype=torch.float32).unsqueeze(0) / 255.0
 
         target = {
-            "boxes": torch.tensor(boxes, dtype=torch.float32),
+            "boxes": torch.tensor(np.asarray(boxes, dtype=np.float32).reshape(-1, 4)),
             "labels": torch.tensor(class_labels, dtype=torch.int64),
-            "img_path": sample['img_path']
+            "img_path": Path(sample.img_path),
+            "dataset": sample.dataset,
+            "seq": sample.seq,
+            "frame_idx": sample.frame_idx,
         }
 
         if "applied_transforms" in augmented:
@@ -176,7 +160,7 @@ class AntiUAVDataset(Dataset):
             debug_img = cv2.cvtColor(img_augmented, cv2.COLOR_GRAY2RGB)
             for bbox in boxes:
                 x0, y0, x1, y1 = int(bbox[0]), int(bbox[1]), int(bbox[0] + bbox[2]), int(bbox[1] + bbox[3])
-                debug_img = cv2.rectangle(debug_img, (x0,y0), (x1,y1) ,color=(255, 0, 0))
+                debug_img = cv2.rectangle(debug_img, (x0, y0), (x1, y1), color=(255, 0, 0))
             target["debug"] = debug_img
 
         return img_tensor, target, img

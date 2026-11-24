@@ -20,15 +20,21 @@ ANNAHMEN, die du an den echten Daten pruefen musst (siehe `inspect_annotation_fo
   3. CST: Schluessel "gt" im JSON oder gt.txt mit x,y,w,h pro Zeile (unbestaetigt).
   4. Alle Frames einer Sequenz haben dieselbe Aufloesung (erstes Frame wird gelesen).
 
+Mehrere Datensaetze
+-------------------
+`build_frame_table` nimmt einen Datensatz-Ordner oder eine Liste davon; die Spalte `dataset`
+haelt fest, woher eine Zeile stammt (Sequenzen werden immer ueber dataset+split+seq identifiziert).
+Einzeln:  df[df.dataset == "CST-AntiUAV"]      Einzeln UND zusammen:  per_dataset(size_report, df)
+
 Typischer Ablauf (Notebook)
 ---------------------------
     from measure import *
-    df = build_frame_table(DATASET_DIR, cache=OUTPUT_DIR / f"{DATA_SET_NAME}_frames.pkl")
-    print(size_report(df, reference=DATA_SET_NAME))
-    print(presence_report(df))
+    df = build_frame_table([ds.root for ds in DATASETS], cache=OUTPUT_DIR / "frames.pkl")
+    print(per_dataset(size_report, df))
+    print(per_dataset(presence_report, df))
     smp = sample_frames(df, n_per_seq=20)
     cdf = measure_target_contrast(smp, hud_rows=96)
-    print(contrast_report(cdf))
+    print(per_dataset(contrast_report, cdf))
 """
 from __future__ import annotations
 
@@ -59,6 +65,28 @@ PAPER_REFERENCE = {
 # =============================================================================
 # 0. Hilfsfunktionen
 # =============================================================================
+def _as_dirs(dirs) -> list[Path]:
+    """Ein Ordner oder eine Liste von Ordnern -> Liste von Paths."""
+    return [Path(dirs)] if isinstance(dirs, (str, Path)) else [Path(d) for d in dirs]
+
+
+SEQ_KEY = ["dataset", "split", "seq"]  # eindeutige Sequenz, auch ueber Datensaetze hinweg
+
+
+def per_dataset(report_fn, df, *args, **kwargs):
+    """Fuehrt einen Report (Funktion df -> DataFrame) fuer jeden Datensatz einzeln und - bei mehreren -
+    fuer alle zusammen aus. Ergebnis: eine Tabelle mit fuehrender Spalte `datensatz`."""
+    parts = [(str(name), g) for name, g in df.groupby("dataset", sort=True, observed=True)]
+    if len(parts) > 1:
+        parts.append((" + ".join(name for name, _ in parts), df))
+    out = []
+    for name, g in parts:
+        res = report_fn(g, *args, **kwargs)
+        res.insert(0, "datensatz", name)
+        out.append(res)
+    return pd.concat(out, ignore_index=True)
+
+
 def _list_frames(seq_dir: Path) -> list[Path]:
     return sorted(p for p in Path(seq_dir).iterdir() if p.suffix.lower() in IMG_EXT)
 
@@ -188,38 +216,45 @@ def _add_derived(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def build_frame_table(dataset_dir, splits=("train", "val", "test"), cache=None, verbose=True):
-    """Teurer Schritt (liest pro Sequenz nur Labels + 1 Bildheader). Ergebnis cachen!"""
+def build_frame_table(dataset_dirs, splits=("train", "val", "test"), cache=None, verbose=True):
+    """Teurer Schritt (liest pro Sequenz nur Labels + 1 Bildheader). Ergebnis cachen!
+    `dataset_dirs`: ein Datensatz-Ordner oder eine Liste; Spalte `dataset` = Ordnername.
+    Achtung: der Cache gilt fuer genau diese Auswahl -> pro Auswahl eigenen Dateinamen verwenden."""
     if cache is not None and Path(cache).exists():
         if verbose:
             print(f"Lade Cache: {cache}")
         return pd.read_pickle(cache)
 
     parts = []
-    for split in splits:
-        split_dir = Path(dataset_dir) / split
-        if not split_dir.is_dir():
-            warnings.warn(f"Split-Ordner fehlt: {split_dir}")
-            continue
-        for sd in sorted(p for p in split_dir.iterdir() if p.is_dir()):
-            d = load_sequence_annotations(sd)
-            if d.empty:
+    for dataset_dir in _as_dirs(dataset_dirs):
+        for split in splits:
+            split_dir = dataset_dir / split
+            if not split_dir.is_dir():
+                warnings.warn(f"Split-Ordner fehlt: {split_dir}")
                 continue
-            with Image.open(d.file.iloc[0]) as im:
-                d["img_w"], d["img_h"] = im.size
-            d["split"] = split
-            parts.append(d)
+            for sd in sorted(p for p in split_dir.iterdir() if p.is_dir()):
+                d = load_sequence_annotations(sd)
+                if d.empty:
+                    continue
+                with Image.open(d.file.iloc[0]) as im:
+                    d["img_w"], d["img_h"] = im.size
+                d["dataset"] = dataset_dir.name
+                d["split"] = split
+                parts.append(d)
     if not parts:
-        raise RuntimeError(f"Keine Sequenzen unter {dataset_dir} gefunden.")
+        raise RuntimeError(f"Keine Sequenzen unter {dataset_dirs} gefunden.")
     df = _add_derived(pd.concat(parts, ignore_index=True))
+    df["dataset"] = df["dataset"].astype("category")  # wenige Werte, viele Zeilen -> spart Speicher
 
     if verbose:
-        names = df.drop_duplicates(["split", "seq"]).groupby("seq").split.nunique()
+        seqs = df.drop_duplicates(SEQ_KEY)
+        names = seqs.groupby(["dataset", "seq"], observed=True).split.nunique()
         dup = names[names > 1]
-        print(f"{df.seq.nunique()} Sequenzen, {len(df)} Frames, {int(df.has_box.sum())} Boxen")
-        print(f"Aufloesungen: {df.drop_duplicates(['split','seq']).groupby(['img_w','img_h']).size().to_dict()}")
+        print(f"{len(seqs)} Sequenzen, {len(df)} Frames, {int(df.has_box.sum())} Boxen")
+        print(f"pro Datensatz: {seqs.groupby('dataset', observed=True).size().to_dict()}")
+        print(f"Aufloesungen: {seqs.groupby(['img_w','img_h']).size().to_dict()}")
         print(f"Sequenznamen in mehreren Splits: {len(dup)}" + (f" -> {list(dup.index[:5])}" if len(dup) else ""))
-        mism = df.drop_duplicates(["split", "seq"])
+        mism = seqs
         mism = mism[mism.n_ann != mism.n_frames]
         if len(mism):
             print(f"WARNUNG: {len(mism)} Sequenzen mit n_ann != n_frames (Zuordnung Bild<->Label unsicher)")
@@ -234,7 +269,7 @@ def sample_frames(df, n_per_seq=20, require_box=True):
     benachbarte Near-Duplicate-Frames werden vermieden)."""
     src = df[df.has_box] if require_box else df
     out = []
-    for _, g in src.groupby(["split", "seq"], sort=True):
+    for _, g in src.groupby(SEQ_KEY, sort=True, observed=True):
         out.append(g.iloc[_even_idx(len(g), n_per_seq)])
     return pd.concat(out, ignore_index=True)
 
@@ -242,9 +277,13 @@ def sample_frames(df, n_per_seq=20, require_box=True):
 # =============================================================================
 # 2. Tabellen-Messungen (kein Bild-I/O)
 # =============================================================================
-def size_report(df, reference=None, by="split"):
+def size_report(df, reference="auto", by="split"):
     """Groessen nach CST-Diagonalen-Klassen (statt COCO-Flaeche) + Stride-Relevanz.
-    `reference`: 'CST-AntiUAV' | 'Anti-UAV410' -> Abgleich mit Paper (nur Plausibilitaet)."""
+    `reference`: 'CST-AntiUAV' | 'Anti-UAV410' -> Abgleich mit Paper (nur Plausibilitaet);
+    'auto' = der Datensatz von df, falls df genau einen enthaelt."""
+    if reference == "auto":
+        present = df["dataset"].unique() if "dataset" in df else []
+        reference = str(present[0]) if len(present) == 1 else None
     b = df[df.has_box]
     rows = []
     for key, g in list(b.groupby(by)) + [("ALL", b)]:
@@ -271,12 +310,12 @@ def presence_report(df):
     """Negativframes, Label-Konsistenz, Abwesenheitsphasen pro Split."""
     rows = []
     for split, g in df.groupby("split"):
-        per_seq = g.groupby("seq")
+        per_seq = g.groupby(SEQ_KEY, observed=True)
         longest = per_seq.exist.apply(lambda s: _longest_false_run(s.to_numpy()))
         n_present = per_seq.exist.sum()
-        seq_meta = g.drop_duplicates("seq")
+        seq_meta = g.drop_duplicates(SEQ_KEY)
         rows.append({
-            "split": split, "n_seq": g.seq.nunique(), "n_frames": len(g),
+            "split": split, "n_seq": len(seq_meta), "n_frames": len(g),
             "mit_ziel (%)": 100 * g.exist.mean(), "ohne_ziel (%)": 100 * (1 - g.exist.mean()),
             "seq_ohne_ziel": int((n_present == 0).sum()), "seq_immer_ziel": int((n_present == per_seq.size()).sum()),
             "laengste_abwesenheit_med": float(longest.median()), "laengste_abwesenheit_max": int(longest.max()),
@@ -340,13 +379,13 @@ def yolo_scale_report(df, imgsz=640, factors=(1.0, 0.75, 0.5, 0.25), thresholds=
 def temporal_redundancy_report(df):
     """Wie redundant sind benachbarte Frames? Nur Messung, keine temporale Modellierung.
     size_jitter = obere Schranke fuer Annotationsrauschen (echte Groessenaenderung ist bei 25 fps klein)."""
-    b = df[df.has_box].sort_values(["split", "seq", "frame_idx"]).copy()
-    g = b.groupby(["split", "seq"])
+    b = df[df.has_box].sort_values([*SEQ_KEY, "frame_idx"]).copy()
+    g = b.groupby(SEQ_KEY, observed=True)
     b["dframe"] = g.frame_idx.diff()
     b["disp"] = np.hypot(g.cx.diff(), g.cy.diff())
     b["dsize"] = g.diag.diff().abs() / g.diag.shift(1)
     cons = b[b.dframe == 1]
-    per_seq = cons.groupby(["split", "seq"]).agg(
+    per_seq = cons.groupby(SEQ_KEY, observed=True).agg(
         n_paare=("disp", "size"), disp_med_px=("disp", "median"),
         still_anteil=("disp", lambda s: float((s < 1).mean())),
         size_jitter_med=("dsize", "median")).reset_index()
@@ -533,18 +572,20 @@ def estimate_overlay(seq_dir, n_frames=30, std_thresh=2.0, extreme=(20, 235), ro
             "row_max": int(rows.max()) if len(rows) else np.nan, "n_frames_used": len(stack)}
 
 
-def overlay_report(dataset_dir, splits=("train", "val", "test"), reference_seq_names=None, **kw):
+def overlay_report(dataset_dirs, splits=("train", "val", "test"), reference_seq_names=None, **kw):
     """Pro Sequenz Overlay-Ausdehnung. `row_max` (z.B. 95. Perzentil) liefert datenbasiert `hud_rows`
     statt der festen 96. `reference_seq_names`: Menge von Sequenznamen aus find_text_in_seq
-    (dort `return all_dirs_set` ergaenzen und Namen via Path(p).name bilden)."""
+    (Rueckgabewert, Namen via Path(p).name bilden). `dataset_dirs`: ein Ordner oder eine Liste."""
     rows = []
-    for split in splits:
-        sdir = Path(dataset_dir) / split
-        for sd in sorted(p for p in sdir.iterdir() if p.is_dir()) if sdir.is_dir() else []:
-            r = estimate_overlay(sd, **kw)
-            if r:
-                r["split"] = split
-                rows.append(r)
+    for dataset_dir in _as_dirs(dataset_dirs):
+        for split in splits:
+            sdir = dataset_dir / split
+            for sd in sorted(p for p in sdir.iterdir() if p.is_dir()) if sdir.is_dir() else []:
+                r = estimate_overlay(sd, **kw)
+                if r:
+                    r["dataset"] = dataset_dir.name
+                    r["split"] = split
+                    rows.append(r)
     out = pd.DataFrame(rows)
     if reference_seq_names is not None and len(out):
         out["east_overlay"] = out.seq.isin(reference_seq_names)
@@ -561,8 +602,8 @@ def hud_overlap_report(df, hud_rows=96, overlay_df=None):
     der tatsaechlich y<=96 zaehlt). Mit overlay_df nur Sequenzen mit erkanntem Overlay."""
     b = df[df.has_box]
     if overlay_df is not None:
-        keep = overlay_df.loc[overlay_df.has_overlay, ["split", "seq"]]
-        b = b.merge(keep, on=["split", "seq"])
+        keep = overlay_df.loc[overlay_df.has_overlay, SEQ_KEY]
+        b = b.assign(dataset=b.dataset.astype(str)).merge(keep, on=SEQ_KEY)
     rows = [{"split": s, "n_boxen": len(g), f"oberkante<{hud_rows} (%)": 100 * (g.y < hud_rows).mean(),
              f"komplett_in_band (%)": 100 * ((g.y + g.h) <= hud_rows).mean()} for s, g in b.groupby("split")]
     return pd.DataFrame(rows).round(2)
@@ -599,7 +640,8 @@ def split_shift_report(table, columns, ref="train", split_col="split", seq_col="
     """Verteilungsunterschied ref-Split vs. andere, aggregiert pro SEQUENZ (Median), weil Frames
     innerhalb einer Sequenz nicht unabhaengig sind. Bewusst KEINE p-Werte.
     ks in [0,1]; w1_rel = Wasserstein-1 / Std(ref), grob: >0.3 deutliche Verschiebung (Faustwert)."""
-    per_seq = table.groupby([split_col, seq_col])[list(columns)].median().reset_index()
+    keys = (["dataset"] if "dataset" in table else []) + [split_col, seq_col]
+    per_seq = table.groupby(keys, observed=True)[list(columns)].median().reset_index()
     rows = []
     for col in columns:
         a = per_seq.loc[per_seq[split_col] == ref, col].dropna().to_numpy()
@@ -637,7 +679,8 @@ def cross_split_near_duplicates(dataset_dir, splits=("train", "val", "test"), re
     ref-Sequenzen, deren naechster ref-Nachbar (leave-one-out) unter derselben Schwelle liegt.
     Ist der val/test-Anteil aehnlich hoch wie der ref-interne, sind die Splits szenisch nicht unabhaengig.
     HEURISTIK: bei bewegter Kamera aendert sich der Hintergrund, Aussagekraft eingeschraenkt.
-    Schwelle/Perzentil ist eine Annahme -> Top-Paare (query_frame/ref_frame) IMMER visuell pruefen."""
+    Schwelle/Perzentil ist eine Annahme -> Top-Paare (query_frame/ref_frame) IMMER visuell pruefen.
+    Pro Datensatz aufrufen (dataset_dir = EIN Datensatz-Ordner): die Schwelle ist datensatzspezifisch."""
     fps, meta = {}, []
     for split in splits:
         sdir = Path(dataset_dir) / split
