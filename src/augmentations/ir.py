@@ -11,7 +11,7 @@ import albumentations as A
 import cv2
 import numpy as np
 
-from augmentations.uint8 import RAMP, check_gray_uint8, to_uint8
+from augmentations.uint8 import RAMP, check_gray_uint8, check_kwargs, to_uint8
 
 
 def netd_noise(image, sigma=0.0):
@@ -247,9 +247,9 @@ IR_EFFECTS: dict[str, Callable[..., np.ndarray]] = {
     "stripe_noise": stripe_noise,
     "netd": netd_noise,
     "salt_and_pepper": salt_and_peper,
-    "histogram_shift": thermal_histogram_shift,              # open: section not decided yet
-    "histogram_compression": thermal_histogram_compression,  # open: section not decided yet
 }
+# thermal_histogram_shift / thermal_histogram_compression stay in this module but belong to the
+# `default:` section (registered in augmentations/default.py).
 
 
 class IRTransform(A.ImageOnlyTransform):
@@ -261,6 +261,7 @@ class IRTransform(A.ImageOnlyTransform):
             raise KeyError(f"Unknown IR effect '{effect}'. Available: {sorted(IR_EFFECTS)}")
         self.effect = effect
         self.fn_kwargs = dict(fn_kwargs or {})
+        check_kwargs(IR_EFFECTS[effect], self.fn_kwargs, f"IR effect '{effect}'")
 
     def apply(self, img: np.ndarray, **_) -> np.ndarray:
         return IR_EFFECTS[self.effect](img, **self.fn_kwargs)

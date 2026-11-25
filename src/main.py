@@ -1,6 +1,7 @@
 """Single entry point for every action. See `python src/main.py --help` and README.md.
 
-Order when several actions are given: prepare (-p), then build the target library (-l), then train (-t).
+Order when several actions are given: prepare (-p), build the target library (-l), freeze the test set
+(--freeze-test), train (-t), resume (-r), robustness evaluation (-e).
 """
 import logging
 import sys
@@ -32,9 +33,23 @@ def main(argv: list[str] | None = None) -> int:
             from data_handler.target_library import LibraryConfig, build_library
             build_library(LibraryConfig(), overwrite=True)
 
+        if args.freeze_test:
+            from config import load_run_config
+            from data_handler.sources import freeze_test_set
+            cfg = load_run_config(args.config)
+            freeze_test_set(cfg, cfg["run"]["test_set"])
+
         if args.train:
             from training.run import run  # heavy imports (torch/ultralytics) only when training
             run(args.config, dry_run=args.dry_run)
+
+        if args.resume:
+            from training.run import run
+            run(None, resume_dir=args.resume)
+
+        if args.evaluate:
+            from training.run import evaluate_run
+            evaluate_run(args.evaluate, suite=args.suite, dry_run=args.dry_run)
     except KeyboardInterrupt:
         logger.warning("Interrupted by user.")
         return 130

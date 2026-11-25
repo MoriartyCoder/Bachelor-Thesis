@@ -45,13 +45,17 @@ Per pasted target, the paper's three steps:
 
 1. Bounding-box copy: crop a target of the *training set* together with its
    surrounding context (a box, not a segmentation mask, because in IR the target's
-   radiation also affects the pixels around it).
+   radiation also affects the pixels around it). ACB is a method for dim and *small*
+   targets (3-5 px in area; Sec. IV-D sets it apart from Copy-Paste for "normal-sized
+   targets"), so only boxes below ``max_area_ratio`` of the frame are copied (0.15 %, the
+   small-target limit also used by PGDAA). Large targets already in a frame stay untouched.
 2. Random augment: RandAugment (Cubuk et al. 2020, ref. [27] of the paper) on the
    patch: ``num_ops`` operations drawn uniformly with replacement from ``ops``, every
    drawn operation is applied, all with the single global magnitude ``magnitude`` on
-   RandAugment's 0..10 scale. The paper does not specify N, M or the search ("automatically
-   learns the optimal strategy", Fig. 4; "parameter-free", Sec. IV-F); here the "auto" part
-   is RandAugment's grid search over (``num_ops``, ``magnitude``): one run config per grid point.
+   RandAugment's 0..10 scale. The paper does not give N, M or the search ("automatically
+   learns the optimal strategy", Fig. 4); the abstract describes ACB as "mapping augment
+   strategies to 2-D space", which is RandAugment's (N, M) space. So the "auto" part here is
+   RandAugment's grid search over (``num_ops``, ``magnitude``): one run config per grid point.
 3. Adaptive paste onto a random position of the current training image (the
    "random background"), with I the background patch of the same size as the
    augmented grayscale target patch T:
@@ -59,17 +63,32 @@ Per pasted target, the paper's three steps:
        T'(x, y) = T(x, y) / max_xy T(x, y)          Eq. (6)
        I'       = T' * T + (1 - T') * I             Eq. (7)
 
+   ``fusion: paper`` (default) is Eq. (6) as written. It assumes the paper's semi-simulated
+   data (Sec. IV-A: synthetic targets with a Gaussian grey-value profile), whose crops have a
+   dark context (Fig. 4). On our frames the context of a small target gets a median weight of
+   0.44, so part of the source background is pasted along and the patch rectangle stays
+   visible. Variant, not in the paper: ``fusion: background`` takes Eq. (6) relative to the
+   patch's background, T' = max(T - b, 0) / max(T - b), b = median grey value of the context
+   (patch outside the box); for a dark context (b ~ 0) it equals Eq. (6).
+
+The paper enriches the dataset once ("initially enriched", Sec. III-A, Fig. 2; Table V gives the
+target share of the enriched set). With ``fixed: true`` (default) a frame gets the same pastes in
+every epoch (RNG seeded from run seed + frame), i.e. that fixed enriched set, built online.
+
 The paper is a segmentation method (a pasted target gets its mask label); here every pasted
 target gets a box. All deviations: augmentations/ACB_deviations.md.
 
 The paper leaves the following open. Each choice is configurable and documented:
 
 * context around the box: ``context`` (fraction of the box side on each side,
-  at least ``min_context_px``);
+  at least ``min_context_px``). Default 1.0 and 8 px: the mask crops of Fig. 4 show
+  0.6-1.9x the target size per side for extended targets and ~5x for a point target;
 * number of pasted targets per image: ``num_targets`` (n or [min, max], uniform).
   Default 1 with p = 1: in Tables V/VI ACB doubles the share of target pixels
-  (x2.02 / x2.06), and on Anti-UAV410 (one target per frame) one paste per frame
-  gives x2.10 (measured with the defaults; three pastes give x3.24);
+  (x2.02 / x2.06), with pastes from the same small-target distribution. One paste per
+  frame doubles our target count (x2.07) and, on CST (small targets as in the paper),
+  also the pixel share (x2.02). Overall the pixel share rises only x1.18, because the
+  large Anti-UAV410 targets (not copied) stay; 500 random training frames, one paste;
 * magnitude: default M = 5. At RandAugment's ImageNet optimum M = 9 the brightness
   factors 0.19 / 1.81 make many small targets vanish or saturate;
 * operations: the paper names Rotate, Flip, Color, Scale, Brightness, Sharpness and
@@ -89,8 +108,9 @@ The paper leaves the following open. Each choice is configurable and documented:
 
 Ablations (paper's Tables V/VI):
   ``num_ops: 0, fusion: none``  -> box copy only (the "CutMix" row: box, no augment, no fusion)
-  defaults                      -> full ACB (box, random augment, adaptive fusion)
+  defaults                      -> full ACB (box, random augment, adaptive fusion = Eq. (6))
   ``fusion: none`` / ``num_ops: 0`` alone -> one component switched off (not in the paper)
+  ``fusion: background``        -> full ACB with the background-relative weight (not in the paper)
 
 Works on grayscale uint8 HxW images (see augmentations/uint8.py) and on any Albumentations
 bbox format; the new boxes get ``class_label`` in every label field. Point operations run
@@ -100,6 +120,7 @@ once. Results are rounded (PIL/torchvision truncate, which darkens by ~0.5 grey 
 from __future__ import annotations
 
 import math
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -120,7 +141,7 @@ logger = get_logger(__name__)
 
 MAX_MAGNITUDE = 10.0  # RandAugment: "integer scale from 0 to 10"; larger values extrapolate
 MIN_BOX_PX = 2.0  # Scale never shrinks a target below this size (in pixels)
-FUSIONS = ("adaptive", "none")
+FUSIONS = ("paper", "background", "none")
 DEFAULT_OPS = ("identity", "rotate", "flip", "scale", "brightness", "sharpness")
 
 
@@ -321,14 +342,33 @@ def rand_augment(p: Patch, ops: Sequence[str], num_ops: int, magnitude: float, r
 # ---------------------------------------------------------------------------
 # Step 3: adaptive paste
 # ---------------------------------------------------------------------------
+def context_level(p: Patch) -> float:
+    """Median grey value b of the patch around the target (valid pixels outside the box); 0 if there are none."""
+    h, w = p.img.shape
+    cx, cy, bw, bh = p.box
+    inside = ((np.abs(np.arange(h) + 0.5 - cy) <= bh / 2)[:, None]
+              & (np.abs(np.arange(w) + 0.5 - cx) <= bw / 2)[None, :])
+    ctx = p.img[p.valid & ~inside]
+    return float(np.median(ctx)) if ctx.size else 0.0
+
+
 def paste_weights(p: Patch, fusion: str) -> np.ndarray | None:
-    """Per-pixel weight of the target patch. `adaptive` = Eq. (6), `none` = plain copy of the patch."""
+    """Per-pixel weight T' of the target patch; None if nothing would be pasted.
+
+    `paper`:      Eq. (6) as written, T / max(T).
+    `background`: Eq. (6) relative to the background, max(T - b, 0) / max(T - b), b = context_level(p)
+                  (not in the paper).
+    `none`:       the patch is copied as is.
+    """
     if fusion == "none":
         return p.valid.astype(np.float32)
-    peak = float(p.img.max())  # invalid pixels are 0, so this is the max over the patch
+    t = p.img.astype(np.float32)
+    if fusion == "background":
+        t = np.clip(t - context_level(p), 0.0, None)
+    peak = float(t.max())  # invalid pixels are 0 (so also <= b): this is the max over the patch
     if peak <= 0:
         return None
-    return p.img.astype(np.float32) / peak
+    return t / peak
 
 
 def fuse(region: np.ndarray, patch: np.ndarray, weights: np.ndarray) -> np.ndarray:
@@ -368,16 +408,24 @@ class ACB(A.DualTransform):
     """Auto-augmented copy-paste bounding-box (Tong et al. 2024). See the module docstring.
 
     Args:
-        records: training FrameRecords; every record with a box is a possible source target.
+        records: training FrameRecords; every record with a box below `max_area_ratio` is a possible
+            source target.
+        max_area_ratio: only boxes whose area / frame area is below this are copied (small targets,
+            0.15 % as in PGDAA); None = every box.
         num_targets: number of targets pasted per image, int or [min, max] (uniform).
         num_ops: RandAugment N, operations per patch (0 = no random augment).
         magnitude: RandAugment M on the 0..10 scale, shared by all operations.
         ops: operation names, see OPS.
         context: context on each side of the box, as a fraction of the box width/height.
         min_context_px: minimum context on each side in pixels.
-        fusion: "adaptive" (Eqs. 6-7) or "none" (patch copied as is).
+        fusion: "paper" (Eqs. 6-7 as written; default), "background" (Eq. 6 relative to the context
+            median; not in the paper) or "none" (patch copied as is).
         max_tries: random positions tried per patch before it is skipped.
         class_label: label of the pasted boxes, in every label field (encoded like the input labels).
+        fixed: True = a frame gets the same pastes in every epoch (the paper's "initially enriched"
+            dataset): the transform's own RNG is seeded per call from the `frame_key` that AlbuStep
+            passes ("<run seed>|<dataset>/<split>/<seq>/<frame>"). Calls without `frame_key`
+            (notebooks, the config check) stay random. False = new pastes in every epoch.
     """
 
     _targets = (Targets.IMAGE, Targets.BBOXES)
@@ -385,21 +433,25 @@ class ACB(A.DualTransform):
     def __init__(
         self,
         records: Sequence[FrameRecord],
+        max_area_ratio: float | None = 0.0015,
         num_targets: int | Sequence[int] = 1,
         num_ops: int = 2,
         magnitude: float = 5.0,
         ops: Sequence[str] = DEFAULT_OPS,
-        context: float = 0.5,
-        min_context_px: float = 4.0,
-        fusion: str = "adaptive",
+        context: float = 1.0,
+        min_context_px: float = 8.0,
+        fusion: str = "paper",
         max_tries: int = 20,
         class_label: float = 0,
+        fixed: bool = True,
         p: float = 1.0,
     ):
         super().__init__(p=p)
         lo, hi = (num_targets, num_targets) if isinstance(num_targets, int) else tuple(num_targets)
         if not 0 <= lo <= hi:
             raise ValueError(f"ACB: num_targets must be n or [min, max] with 0 <= min <= max, got {num_targets}")
+        if not isinstance(fixed, bool):
+            raise ValueError(f"ACB: fixed must be true or false, got {fixed!r}")
         unknown = [o for o in ops if o not in OPS]
         if unknown:
             raise ValueError(f"ACB: unknown ops {unknown}. Available: {sorted(OPS)}")
@@ -408,9 +460,17 @@ class ACB(A.DualTransform):
         if num_ops < 0 or magnitude < 0 or context < 0 or min_context_px < 0 or max_tries < 1:
             raise ValueError("ACB: num_ops, magnitude, context, min_context_px must be >= 0 and max_tries >= 1")
 
-        self.sources = [r for r in records if r.bbox is not None]
+        if max_area_ratio is not None and max_area_ratio <= 0:
+            raise ValueError(f"ACB: max_area_ratio must be > 0 or None, got {max_area_ratio}")
+
+        boxed = [r for r in records if r.bbox is not None]
+        self.max_area_ratio = None if max_area_ratio is None else float(max_area_ratio)
+        self.sources = boxed if self.max_area_ratio is None else [
+            r for r in boxed if r.bbox[2] * r.bbox[3] / (r.img_w * r.img_h) < self.max_area_ratio]
         if not self.sources:
-            raise ValueError("ACB: no training record with a box, nothing to copy.")
+            raise ValueError("ACB: no training box" + (f" below max_area_ratio {self.max_area_ratio:g}"
+                                                       if self.max_area_ratio is not None else "")
+                             + ", nothing to copy.")
         self.num_targets = (int(lo), int(hi))
         self.num_ops = int(num_ops)
         self.magnitude = float(magnitude)
@@ -420,8 +480,20 @@ class ACB(A.DualTransform):
         self.fusion = fusion
         self.max_tries = int(max_tries)
         self.class_label = class_label
-        logger.debug(f"ACB: {len(self.sources)} source targets, num_targets={self.num_targets}, "
-                     f"N={self.num_ops}, M={self.magnitude}, ops={self.ops}, fusion={self.fusion}")
+        self.fixed = fixed
+        logger.info(f"ACB: {len(self.sources)} source targets of {len(boxed)} training boxes"
+                    + (f" (area ratio < {self.max_area_ratio:g})" if self.max_area_ratio is not None else "")
+                    + (", fixed per frame" if self.fixed else ", new pastes every epoch"))
+        logger.debug(f"ACB: num_targets={self.num_targets}, N={self.num_ops}, M={self.magnitude}, "
+                     f"ops={self.ops}, fusion={self.fusion}")
+
+    def __call__(self, *args: Any, force_apply: bool = False, **kwargs: Any) -> Any:
+        key = kwargs.get("frame_key")
+        if self.fixed and key is not None:
+            # Same frame -> same RNG state -> same decision (p), sources, ops and positions in every epoch.
+            # The Compose gives every transform its own RNG objects, so the others stay random.
+            self.set_random_seed(zlib.crc32(f"ACB|{key}".encode()))
+        return super().__call__(*args, force_apply=force_apply, **kwargs)
 
     @property
     def targets_as_params(self) -> list[str]:
@@ -429,8 +501,8 @@ class ACB(A.DualTransform):
 
     def get_transform_init_args_names(self) -> tuple[str, ...]:
         # `records` is left out on purpose: repr/serialization would print every source frame.
-        return ("num_targets", "num_ops", "magnitude", "ops", "context", "min_context_px", "fusion",
-                "max_tries", "class_label")
+        return ("max_area_ratio", "num_targets", "num_ops", "magnitude", "ops", "context", "min_context_px",
+                "fusion", "max_tries", "class_label", "fixed")
 
     def _encoded_labels(self, data: dict[str, Any]) -> list[float]:
         return encoded_labels(self, data, self.class_label)

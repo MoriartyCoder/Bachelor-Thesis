@@ -1,0 +1,63 @@
+# =============================================================================
+# Robustness suite: fixed corruption tests on the frozen test set (configs/test_set.csv).
+#
+# After training (run config: run.robustness_suite: configs/robustness.yaml) or for a finished run:
+#   python src/main.py -e weights/<YYYYMMDD-HHMMSS>  [--suite configs/robustness.yaml]  [--dry-run]
+# Result: <run folder>/robustness_metrics.json (clean + per test, same groups as test_metrics.json,
+# delta = test - clean). Diagnosis only: model selection stays on the clean val set.
+#
+# Like the test set, keep this file FIXED once experiments are compared (its sha256 is stored in every
+# result). Each test is applied to EVERY test frame; the random state depends only on
+# (test name, frame), so every model sees exactly the same corrupted frames. Renaming a test changes its frames.
+#
+# A test: `name` + one or more of the sections default / ir / edge_cases, with the same entries and
+# one_of groups as the `augmentation:` section of a run config (sections run in the order
+# default -> edge_cases -> ir). `sota` (copy-paste) is not allowed. Use p: 1.0 so every frame is corrupted.
+# Severity levels = separate tests (netd_s1, netd_s2, ...).
+#
+# Note: a test whose effect (and level) is also in the training pipeline measures in-distribution
+# robustness, not robustness to unseen conditions.
+#
+# The tests below are EXAMPLES (stronger than the training defaults in configs/template.yaml);
+# the list and the levels are still to be decided.
+# =============================================================================
+
+bbox:
+  min_visibility: 0.3   # only matters for spatial tests (flip)
+  clip: true
+
+tests:
+  # --- sensor noise ---
+  - name: netd_strong
+    ir:
+      - {name: netd, p: 1.0, params: {sigma: 0.03}}
+  - name: fpn_pixel
+    ir:
+      - {name: fpn, p: 1.0, params: {sigma_gain: 0.05, sigma_offset: 6.0, mode: pixel}}
+  - name: stripe_noise
+    ir:
+      - {name: stripe_noise, p: 1.0, params: {sigma_offset: 6.0}}
+  - name: salt_and_pepper
+    ir:
+      - {name: salt_and_pepper, p: 1.0, params: {p: 0.01, q: 0.01}}
+
+  # --- blur ---
+  - name: optical_blur
+    ir:
+      - {name: optical_blur, p: 1.0, params: {sigma_0: 2.0, rho: 1.0}}
+  - name: motion_blur
+    ir:
+      - {name: motion_blur, p: 1.0, params: {sigma_0: 3.0, rho: 0.15, theta: 0.0}}
+
+  # --- grey values (thermal drift / crossover) ---
+  - name: histogram_shift_50
+    default:
+      - {name: histogram_shift, p: 1.0, params: {delta_limit: 50}}
+  - name: histogram_compression_0.4
+    default:
+      - {name: histogram_compression, p: 1.0, params: {gamma_min: 0.4, gamma_max: 0.4}}
+
+  # --- geometry (in-distribution if HorizontalFlip is used in training) ---
+  - name: hflip
+    default:
+      - {name: HorizontalFlip, p: 1.0}

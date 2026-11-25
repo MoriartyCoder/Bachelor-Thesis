@@ -1,3 +1,4 @@
+import hashlib
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -12,6 +13,8 @@ NOTEBOOKS_DIR = ROOT_DIR / "notebooks"
 LOGS_DIR = ROOT_DIR / "logs"
 WEIGHTS_DIR = ROOT_DIR / "weights"
 CONFIGS_DIR = ROOT_DIR / "configs"
+TEST_SET_FILE = CONFIGS_DIR / "test_set.csv"  # frozen test frames (python src/main.py -c <cfg> --freeze-test)
+ROBUSTNESS_SUITE_FILE = CONFIGS_DIR / "robustness.yaml"  # fixed corruption tests (training/evaluate.py)
 LIBRARY_DIR = DATA_DIR / "library"  # PGDA target library (data_handler/target_library.py), not created on import
 
 
@@ -113,7 +116,10 @@ def load_run_config(path: str | Path) -> dict[str, Any]:
     run.setdefault("deterministic", True)
     run.setdefault("checkpoint_every_n_epochs", -1)
     run.setdefault("test_after_training", True)
+    run["test_set"] = _resolve(run.get("test_set", TEST_SET_FILE))
     run["output_root"] = _resolve(run.get("output_root", WEIGHTS_DIR))
+    suite = run.get("robustness_suite")  # null = no robustness evaluation after training
+    run["robustness_suite"] = _resolve(suite) if suite else None
 
     if not cfg["datasets"]:
         raise ConfigError("`datasets` is empty.")
@@ -131,8 +137,11 @@ def load_run_config(path: str | Path) -> dict[str, Any]:
         ds.setdefault("enabled", True)
         ds["root"] = _resolve(ds["root"]) if "root" in ds else ds["name"].root
 
+    # sampling.test is only used by --freeze-test; training always evaluates the frozen test set (run.test_set)
     for split in SPLITS:
         if split not in cfg["sampling"]:
+            if split == "test":
+                continue
             raise ConfigError(f"`sampling.{split}` is missing.")
         if "method" not in cfg["sampling"][split]:
             raise ConfigError(f"`sampling.{split}.method` is missing.")
@@ -161,12 +170,23 @@ def load_run_config(path: str | Path) -> dict[str, Any]:
     return cfg
 
 
+def _check_p(p: Any, where: str) -> None:
+    if isinstance(p, bool) or not isinstance(p, (int, float)) or not 0.0 <= float(p) <= 1.0:
+        raise ConfigError(f"{where}: `p` must be a number in [0, 1], got {p!r}.")
+
+
 def _validate_entry(entry: Any, where: str) -> None:
     if not isinstance(entry, dict) or "name" not in entry:
         raise ConfigError(f"Augmentation entry {entry} in {where} is missing `name`.")
+    unknown = set(entry) - {"name", "enabled", "p", "params"}
+    if unknown:
+        raise ConfigError(f"{where}.{entry['name']}: unknown keys {sorted(unknown)} (allowed: name, enabled, p, params).")
     entry.setdefault("enabled", True)
     entry.setdefault("p", 1.0)
-    entry.setdefault("params", {})
+    entry["params"] = entry.get("params") or {}
+    _check_p(entry["p"], f"{where}.{entry['name']}")
+    if not isinstance(entry["params"], dict):
+        raise ConfigError(f"{where}.{entry['name']}: `params` must be a mapping, got {entry['params']!r}.")
 
 
 def _validate_augmentation(aug: dict) -> None:
@@ -207,6 +227,7 @@ def _validate_augmentation(aug: dict) -> None:
                     raise ConfigError(f"Unknown keys {sorted(unknown)} in {where} (allowed: enabled, p, pipeline).")
                 group.setdefault("enabled", True)
                 group.setdefault("p", 1.0)
+                _check_p(group["p"], where)
                 group["pipeline"] = group.get("pipeline") or []
                 for member in group["pipeline"]:
                     if isinstance(member, dict) and "one_of" in member:
@@ -214,6 +235,50 @@ def _validate_augmentation(aug: dict) -> None:
                     _validate_entry(member, where)
             else:
                 _validate_entry(item, f"augmentation.{section}")
+
+
+# Sections a robustness test may use: corruptions only (no copy-paste, which also needs the train records).
+ROBUSTNESS_SECTIONS = tuple(s for s in AUG_SECTION_ORDER if s != "sota")
+
+
+def load_robustness_suite(path: str | Path) -> tuple[list[tuple[str, dict]], str]:
+    """The tests of a robustness suite YAML (configs/robustness.yaml) and the file's sha256.
+
+    Every test becomes a complete, validated `augmentation` dict (same entry/one_of syntax as the run config,
+    sections in AUG_SECTION_ORDER), so data_handler.augmentation.build_albumentations can build it unchanged.
+    """
+    path = _resolve(path)
+    if not path.exists():
+        raise ConfigError(f"Robustness suite {path} not found.")
+    raw = path.read_bytes()
+    suite = yaml.safe_load(raw) or {}
+    unknown = set(suite) - {"bbox", "tests"}
+    if unknown:
+        raise ConfigError(f"{path.name}: unknown keys {sorted(unknown)} (allowed: bbox, tests).")
+    bbox = suite.get("bbox") or {}
+    tests, names = [], set()
+    for i, test in enumerate(suite.get("tests") or []):
+        if not isinstance(test, dict) or not test.get("name"):
+            raise ConfigError(f"{path.name}: test #{i + 1} is missing `name`.")
+        name = str(test["name"])
+        if name in names:
+            raise ConfigError(f"{path.name}: test name '{name}' is used twice.")
+        names.add(name)
+        sections = set(test) - {"name"}
+        bad = sections - set(ROBUSTNESS_SECTIONS)
+        if bad:
+            raise ConfigError(f"{path.name}, test '{name}': sections {sorted(bad)} are not allowed "
+                              f"(allowed: {', '.join(ROBUSTNESS_SECTIONS)}).")
+        aug = {"bbox": dict(bbox), "order": list(AUG_SECTION_ORDER)}
+        aug.update({s: {"enabled": s in sections, "pipeline": test.get(s) or []} for s in AUG_SECTION_ORDER})
+        try:
+            _validate_augmentation(aug)
+        except ConfigError as e:
+            raise ConfigError(f"{path.name}, test '{name}': {e}") from e
+        tests.append((name, aug))
+    if not tests:
+        raise ConfigError(f"{path.name}: `tests` is empty.")
+    return tests, hashlib.sha256(raw).hexdigest()
 
 
 TEMPLATE_CONFIG = {

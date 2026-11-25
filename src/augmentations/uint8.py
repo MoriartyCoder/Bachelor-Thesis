@@ -12,6 +12,9 @@ float or 3-channel path anywhere in the pipeline.
 """
 from __future__ import annotations
 
+import inspect
+from typing import Callable
+
 import numpy as np
 
 RAMP = np.arange(256, dtype=np.float32)  # all uint8 grey values: input of a lookup table
@@ -27,3 +30,16 @@ def to_uint8(x: np.ndarray) -> np.ndarray:
 def check_gray_uint8(img: np.ndarray) -> None:
     if img.dtype != np.uint8 or img.ndim != 2:
         raise TypeError(f"expected a grayscale uint8 HxW image, got {img.dtype} with shape {img.shape}")
+
+
+def check_kwargs(fn: Callable, kwargs: dict, label: str) -> None:
+    """Raise TypeError if `fn(image, **kwargs)` would not accept `kwargs` (e.g. a misspelled parameter).
+
+    Used when a transform is built, so a config error shows up at the start of a run and not at the
+    first call inside a DataLoader worker.
+    """
+    try:
+        inspect.signature(fn).bind(None, **kwargs)
+    except TypeError as e:
+        params = [n for n in inspect.signature(fn).parameters][1:]
+        raise TypeError(f"{label}: {e}. Parameters: {params}") from None

@@ -10,7 +10,7 @@ from ultralytics.utils.torch_utils import unwrap_model
 
 from data_handler.formats import FrameRecord
 from log_setup import get_logger
-from data_handler.yolo_dataset import build_record_dataset
+from data_handler.yolo_dataset import EvalAlbuStep, build_record_dataset
 
 logger = get_logger(__name__)
 
@@ -48,13 +48,28 @@ class RecordDetectionTrainer(DetectionTrainer):
 
 
 class RecordDetectionValidator(DetectionValidator):
-    """Standalone evaluation (e.g. test split) on FrameRecords; never augments."""
+    """Standalone evaluation (e.g. test split) on FrameRecords; never augments (`eval_albu`: only the fixed
+    corruption of a robustness test, see training/evaluate.py).
 
-    def __init__(self, split_records: dict[str, list[FrameRecord]], **kwargs):
+    Also keeps the matching statistics of every image (`image_stats`: img_path -> tp, conf, pred_cls,
+    target_cls, target_img), so that subsets of the frames can be evaluated afterwards without running
+    the model again (training/evaluate.py).
+    """
+
+    def __init__(self, split_records: dict[str, list[FrameRecord]], eval_albu: EvalAlbuStep | None = None, **kwargs):
         self.split_records = split_records
+        self.eval_albu = eval_albu  # robustness test: fixed per-frame corruption before the letterbox
+        self.image_stats: dict[str, dict] = {}
         super().__init__(**kwargs)
+
+    def update_metrics(self, preds, batch) -> None:
+        n0 = len(self.metrics.stats["tp"])
+        super().update_metrics(preds, batch)
+        for si in range(len(preds)):
+            self.image_stats[str(batch["im_file"][si])] = {k: v[n0 + si] for k, v in self.metrics.stats.items()}
 
     def build_dataset(self, img_path, mode="val", batch=None):
         records = self.split_records[_split_of(img_path)]
         stride = self.stride.max() if hasattr(self.stride, "max") else self.stride
-        return build_record_dataset(self.args, records, None, batch, self.data, mode="val", stride=max(int(stride), 32))
+        return build_record_dataset(self.args, records, None, batch, self.data, mode="val", stride=max(int(stride), 32),
+                                    eval_albu=self.eval_albu)

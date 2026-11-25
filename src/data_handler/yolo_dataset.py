@@ -4,9 +4,14 @@
 .txt files, no .cache files) and replaces the Ultralytics augmentation stack with
 our Albumentations pipeline. Ultralytics' mosaic/affine/HSV/flip and its built-in
 Albumentations step are never constructed.
+
+`EvalAlbuStep` applies a fixed corruption to the evaluation frames (robustness tests, training/evaluate.py),
+seeded per frame so every model sees exactly the same corrupted images.
 """
 from __future__ import annotations
 
+import zlib
+from pathlib import Path
 from typing import Any
 
 import albumentations as A
@@ -19,17 +24,31 @@ from ultralytics.utils import LOGGER, colorstr
 from data_handler.formats import FrameRecord
 
 
-class AlbuStep:
-    """Ultralytics transform step that runs an Albumentations Compose on image + boxes."""
+def frame_id(im_file: str) -> str:
+    """<dataset>/<split>/<seq>/<frame>: names a frame independently of the machine."""
+    return "/".join(Path(im_file).parts[-4:])
 
-    def __init__(self, transform: A.Compose):
+
+class AlbuStep:
+    """Ultralytics transform step that runs an Albumentations Compose on image + boxes.
+
+    Every call also passes `frame_key` = "<run seed>|<dataset>/<split>/<seq>/<frame>" to the Compose.
+    Transforms ignore it, except ACB with `fixed: true`, which seeds its own RNG from it so that a frame
+    gets the same pastes in every epoch (the paper's "initially enriched" dataset).
+    """
+
+    def __init__(self, transform: A.Compose, seed: int = 0):
         self.transform = transform
+        self.seed = seed  # run seed (Ultralytics `seed`), part of the frame key
 
     def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
         if getattr(self.transform, "seed", None) != torch.initial_seed():
             # own RNG per DataLoader worker (same approach as ultralytics' Albumentations wrapper)
             self.transform.set_random_seed(torch.initial_seed())
+        return self.apply(labels)
 
+    def apply(self, labels: dict[str, Any]) -> dict[str, Any]:
+        """Run the Compose on image + boxes of one Ultralytics label dict."""
         img = labels["img"][..., 0]  # Ultralytics loads grayscale as HxWx1; the pipeline works on HxW (view)
         h, w = img.shape
         instances = labels["instances"]
@@ -38,7 +57,8 @@ class AlbuStep:
         bboxes = np.clip(instances.bboxes, 0.0, 1.0)
         cls = labels["cls"].reshape(-1)
 
-        new = self.transform(image=img, bboxes=bboxes, class_labels=cls)
+        new = self.transform(image=img, bboxes=bboxes, class_labels=cls,
+                             frame_key=f"{self.seed}|{frame_id(labels['im_file'])}")
 
         labels["img"] = np.ascontiguousarray(new["image"])[..., None]
         labels["cls"] = np.asarray(new["class_labels"], dtype=np.float32).reshape(-1, 1)
@@ -47,11 +67,31 @@ class AlbuStep:
         return labels
 
 
+class EvalAlbuStep(AlbuStep):
+    """AlbuStep for evaluation: the random state depends only on (test name, <dataset>/<split>/<seq>/<frame>).
+
+    Seeds the global NumPy RNG (used by the IR / grey-value functions) and the Compose's own RNG
+    before every frame, so the corrupted frame is the same for every model, worker count and batch size.
+    """
+
+    def __init__(self, transform: A.Compose, name: str):
+        super().__init__(transform)
+        self.name = name
+
+    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
+        seed = zlib.crc32(f"{self.name}|{frame_id(labels['im_file'])}".encode())
+        np.random.seed(seed)
+        self.transform.set_random_seed(seed)
+        return self.apply(labels)
+
+
 class RecordYOLODataset(YOLODataset):
-    def __init__(self, *args, records: list[FrameRecord], albu: A.Compose | None = None, **kwargs):
+    def __init__(self, *args, records: list[FrameRecord], albu: A.Compose | None = None,
+                 eval_albu: EvalAlbuStep | None = None, **kwargs):
         # must exist before super().__init__, which calls get_img_files/get_labels/build_transforms
         self.records = records
         self.albu = albu
+        self.eval_albu = eval_albu  # evaluation only (augment=False): fixed per-frame corruption
         super().__init__(*args, **kwargs)
 
     def get_img_files(self, img_path) -> list[str]:
@@ -91,11 +131,13 @@ class RecordYOLODataset(YOLODataset):
 
     def build_transforms(self, hyp) -> Compose:
         if self.augment:
-            steps = [AlbuStep(self.albu)] if self.albu is not None else []
+            steps = [AlbuStep(self.albu, seed=int(hyp.seed))] if self.albu is not None else []
             steps.append(LetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=False))
             transforms = Compose(steps)
         else:
-            transforms = Compose([LetterBox(new_shape=self.imgsz, scaleup=False)])
+            steps = [self.eval_albu] if self.eval_albu is not None else []
+            steps.append(LetterBox(new_shape=self.imgsz, scaleup=False))
+            transforms = Compose(steps)
         transforms.append(
             Format(
                 bbox_format="xywh",
@@ -112,12 +154,17 @@ class RecordYOLODataset(YOLODataset):
         return transforms
 
 
-def build_record_dataset(cfg, records, albu, batch, data, mode="train", stride=32) -> RecordYOLODataset:
-    """Same arguments as ultralytics.data.build_yolo_dataset, but backed by FrameRecords."""
+def build_record_dataset(cfg, records, albu, batch, data, mode="train", stride=32,
+                         eval_albu: EvalAlbuStep | None = None) -> RecordYOLODataset:
+    """Same arguments as ultralytics.data.build_yolo_dataset, but backed by FrameRecords.
+
+    `albu` is used only in train mode, `eval_albu` (robustness tests) only in val mode.
+    """
     train = mode == "train"
     return RecordYOLODataset(
         records=records,
         albu=albu if train else None,
+        eval_albu=None if train else eval_albu,
         img_path=f"<records:{mode}>",
         imgsz=cfg.imgsz,
         batch_size=batch,
