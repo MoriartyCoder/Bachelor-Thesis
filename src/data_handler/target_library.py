@@ -19,6 +19,8 @@ from pseudo masks. To stay close to "every training target", the default uses al
 2. Pseudo mask: inside the box, the target is separated from its local background by a contrast
    threshold. The background is the ring (box +- d) minus (box +- gap), with d = 20 as PGDA's SCR
    neighbourhood. The polarity (bright/dark target) comes from the stronger extreme in the box.
+   Small specks are dropped; if the mask still consists of several blobs, the target is rejected
+   (``split_mask``), so every cutout is one connected piece.
 3. Cutout: the target pixels are kept and everything else is 0 (black). The mask is the alpha
    channel, so the background is also transparent ("LA" PNG).
 
@@ -70,8 +72,12 @@ SIZE_KEY = "TS"
 SIZE_EDGES = (10.0, 30.0, 50.0)  # sqrt(w*h) in px; reproduces TS on all tagged train frames
 SIZE_CLASSES = {0: "<=10 px", 1: "10-30 px", 2: "30-50 px", 3: ">50 px"}
 TAG_NAMES = {
-    "LR": "undokumentiert (immer 0)", "VE": "undokumentiert, gemessen: Ziel nicht sichtbar", "OC": "Okklusion",
-    "FM": "schnelle Bewegung", "SV": "Skalenänderung", "IC": "undokumentiert, gemessen: geringer Kontrast",
+    "LR": "undokumentiert (immer 0)", 
+    "VE": "undokumentiert, gemessen: Ziel nicht sichtbar", 
+    "OC": "Okklusion",
+    "FM": "schnelle Bewegung", 
+    "SV": "Skalenänderung", 
+    "IC": "undokumentiert, gemessen: geringer Kontrast",
     "DBC": "dynamischer Hintergrund-Clutter",
 }
 
@@ -114,7 +120,8 @@ class LibraryConfig:
     k_sigma: float = 3.0                    # threshold >= k_sigma * sigma_b ...
     rel_thresh: float = 0.2                 # ... and >= rel_thresh * peak contrast (0.3 cut off thin arms)
     box_tol: int = 2                        # mask may exceed the box by this many px
-    min_component_frac: float = 0.25        # keep blobs >= this fraction of the peak blob
+    min_component_frac: float = 0.25        # blob >= this fraction of the peak blob = second part -> split_mask;
+                                            # smaller blobs are dropped
     min_mask_px: int = 4
     fill_range: tuple[float, float] = (0.05, 0.9)  # mask px / box area
     pad: int = 2                            # border around the cutout
@@ -367,13 +374,15 @@ def segment_target(img: np.ndarray, bbox, cfg: LibraryConfig) -> TargetCut:
     cut.threshold = thr
     fg = (s > thr) & allowed
 
-    # 2. Close small gaps, keep the blob with the peak pixel (+ large neighbours), fill holes
+    # 2. Close small gaps, keep the blob with the peak pixel (+ large neighbours), fill holes;
+    #    more than one blob -> rejected in step 3
     closed = cv2.morphologyEx(fg.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8)).astype(bool) & allowed
     n_lab, labels, cc_stats, _ = cv2.connectedComponentsWithStats(closed.astype(np.uint8), connectivity=8)
     if n_lab <= 1:
         cut.context_mask = closed
         cut.reason = "tiny_mask"
         return cut
+    
     box_s = np.where(allowed, s, -np.inf)
     py, px = np.unravel_index(np.argmax(box_s), s.shape)
     main = labels[py, px]
@@ -396,6 +405,9 @@ def segment_target(img: np.ndarray, bbox, cfg: LibraryConfig) -> TargetCut:
         return cut
     if fill > cfg.fill_range[1]:
         cut.reason = "fill_high"
+        return cut
+    if len(keep) > 1:  # target split into several parts: a cutout must be one connected blob
+        cut.reason = "split_mask"
         return cut
 
     # 4. Cutout = union(box, mask box) + pad; 0 outside the mask
@@ -472,6 +484,7 @@ def build_library(cfg: LibraryConfig | None = None, out_dir: Path = LIBRARY_DIR,
                                   "nothing deleted.")
         logger.info(f"Deleting existing library {out_dir}")
         shutil.rmtree(out_dir)
+
     start = time.perf_counter()
 
     candidates, funnel = [], {}
@@ -480,10 +493,12 @@ def build_library(cfg: LibraryConfig | None = None, out_dir: Path = LIBRARY_DIR,
         if not records:
             logger.warning(f"No frames in {ds}/{cfg.split}, skipped.")
             continue
+
         logger.info(f"{ds}:")
         cands, ds_funnel = select_candidates(records, load_frame_tags(ds.root / cfg.split), cfg)
         candidates += cands
         funnel[ds.value] = ds_funnel
+
     if not candidates:
         raise NoDataError(f"No candidates in {[d.value for d in cfg.datasets]}/{cfg.split}.")
 
@@ -494,16 +509,17 @@ def build_library(cfg: LibraryConfig | None = None, out_dir: Path = LIBRARY_DIR,
 
     rows, reasons = [], Counter()
     for i, cand in enumerate(candidates, 1):
-        r = cand.record
-        img = cv2.imread(r.img_path, cv2.IMREAD_GRAYSCALE)
+        record = cand.record
+        img = cv2.imread(record.img_path, cv2.IMREAD_GRAYSCALE)
         if img is None:
-            logger.warning(f"Cannot read {r.img_path}, skipped.")
+            logger.warning(f"Cannot read {record.img_path}, skipped.")
             reasons["unreadable"] += 1
             continue
-        cut = segment_target(img, r.bbox, cfg)
+
+        cut = segment_target(img, record.bbox, cfg)
         reasons[cut.reason] += 1
         if cut.ok:
-            tid = f"{r.dataset.value}__{r.seq}__{r.frame_idx:06d}"
+            tid = f"{record.dataset.value}__{record.seq}__{record.frame_idx:06d}"
             rel = f"{TARGETS_DIR}/{tid}.png"
             save_cutout(out_dir / rel, cut.gray, cut.mask)
             rows.append(_row(cut, cand, tid, rel, cfg))
@@ -514,6 +530,7 @@ def build_library(cfg: LibraryConfig | None = None, out_dir: Path = LIBRARY_DIR,
     df.to_csv(out_dir / CSV_FILE, index=False)
     for ds_name, ds_funnel in funnel.items():
         ds_funnel["saved"] = int((df.dataset == ds_name).sum())
+        
     n_seq = int(df.groupby(["dataset", "seq"]).ngroups)
     info.update({"status": "complete", "funnel": funnel, "segmentation": dict(reasons.most_common()),
                  "n_targets": len(df), "n_sequences": n_seq,
@@ -522,4 +539,5 @@ def build_library(cfg: LibraryConfig | None = None, out_dir: Path = LIBRARY_DIR,
     (out_dir / INFO_FILE).write_text(json.dumps(info, indent=2), encoding="utf-8")
     logger.info(f"Library: {len(df)} targets from {n_seq} sequences {info['per_dataset']} -> {out_dir} "
                 f"({info['duration_s']} s). Segmentation: {dict(reasons.most_common())}")
+    
     return load_library(out_dir)
