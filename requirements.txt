@@ -1,8 +1,8 @@
 # Python 3.10
 # On the GPU machine install the CUDA build of torch/torchvision matching its driver first,
 # see https://pytorch.org/get-started/locally/ (e.g. --index-url https://download.pytorch.org/whl/cu130)
-torch>=2.4
-torchvision>=0.19
+torch>=2.0.0
+torchvision>=0.15.0
 ultralytics==8.4.216      # custom trainer/dataset hook into internals -> keep pinned
 albumentations==2.0.8
 opencv-python>=4.10
@@ -12,3 +12,5 @@ pandas
 pillow
 pyyaml
 tensorboard
+ipykernel
+nbformat
